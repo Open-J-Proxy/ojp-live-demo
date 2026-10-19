@@ -9,7 +9,11 @@ export RESULTS_DIR
 export LOCAL_UID="${LOCAL_UID:-$(id -u)}"
 export LOCAL_GID="${LOCAL_GID:-$(id -g)}"
 
-compose() { docker compose --project-directory "$ROOT_DIR" -f "$ROOT_DIR/compose.yaml" "$@"; }
+compose() {
+  local files=(-f "$ROOT_DIR/compose.yaml")
+  if [[ -n "${COMPOSE_OVERRIDE_FILE:-}" ]]; then files+=(-f "$COMPOSE_OVERRIDE_FILE"); fi
+  docker compose --project-directory "$ROOT_DIR" "${files[@]}" "$@"
+}
 application_url() {
   if [[ -n "${APP_URL:-}" ]]; then
     printf '%s\n' "$APP_URL"
@@ -40,22 +44,8 @@ EOF
   fi
 }
 wait_app() {
-  python3 - "$(application_url)" "${START_TIMEOUT:-180}" <<'PY'
-import json, sys, time, urllib.request
-url, timeout = sys.argv[1], float(sys.argv[2])
-deadline = time.monotonic() + timeout
-last = ""
-while time.monotonic() < deadline:
-    try:
-        with urllib.request.urlopen(url + "/ready", timeout=5) as response:
-            if response.status == 200 and json.load(response).get("ready") is True:
-                break
-    except Exception as error:
-        last = str(error)
-    time.sleep(1)
-else:
-    raise SystemExit(f"Application readiness timed out at {url}/ready: {last}")
-PY
+  python3 "$SCRIPT_DIR/http_client.py" ready --url "$(application_url)" \
+    --timeout "${START_TIMEOUT:-180}"
 }
 run_load() {
   local scenario="$1"; shift

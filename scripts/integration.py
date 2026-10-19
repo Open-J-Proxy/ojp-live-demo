@@ -18,6 +18,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from resources import ResourceSampler
+from compose_command import compose_command
+from http_client import HTTPBridge
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "scripts"
@@ -25,7 +27,7 @@ COMPOSE = ["docker", "compose", "--project-directory", str(ROOT), "-f", str(ROOT
 TABLES = ("users", "products", "orders", "order_items", "reviews")
 DELAY_PROXY = r'''
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-import time, urllib.request, urllib.error
+import os, time, urllib.request, urllib.error
 class Proxy(BaseHTTPRequestHandler):
     def log_message(self, *args): pass
     def forward(self):
@@ -35,7 +37,7 @@ class Proxy(BaseHTTPRequestHandler):
         headers = {}
         if self.headers.get("Authorization"):
             headers["Authorization"] = self.headers["Authorization"]
-        request = urllib.request.Request("http://app:8080" + self.path, data=data,
+        request = urllib.request.Request(os.environ["TARGET_APP_URL"] + self.path, data=data,
                                          method=self.command, headers=headers)
         try:
             response = urllib.request.urlopen(request, timeout=60)
@@ -86,9 +88,47 @@ class Environment:
             self.env[name] = "0"
         self.env.pop("APP_URL", None)
         self.base = None
+        self.bridge = None
         # Never inherit a user's production connection override into the isolated stack.
         self.env.pop("OJP_URL", None)
         self.env.pop("OJP_HA_URL", None)
+        self.env.pop("COMPOSE_COMPATIBILITY", None)
+        postgres = self.project + "-postgres-1"
+        primary = self.project + "-ojp-1"
+        self.env["APP_INTERNAL_URL"] = "http://" + self.project + "-app-1:8080"
+        backend = "_postgresql://" + postgres + ":5432/shop?ApplicationName=demo-ojp"
+        self.env["OJP_HA_URL"] = "jdbc:ojp[" + ",".join(
+            self.project + "-" + node + "-1:1059" for node in ("ojp", "ojp2", "ojp3")) + "]" + backend
+        prometheus = {
+            "global": {"scrape_interval": "2s", "evaluation_interval": "2s"},
+            "scrape_configs": [
+                {"job_name": job, "static_configs": [{"targets": [target]}]}
+                for job, target in (
+                    ("app", self.project + "-app-1:8081"),
+                    ("postgres", self.project + "-postgres-exporter-1:9187"),
+                    ("ojp", primary + ":9159"), ("prometheus", "localhost:9090"))
+            ] + [{"job_name": "ojp-ha", "dns_sd_configs": [{
+                "names": [self.project + "-ojp2-1", self.project + "-ojp3-1"],
+                "type": "A", "port": 9159, "refresh_interval": "5s"}]}],
+        }
+        prom_file = self.output / "prometheus.json"
+        prom_file.write_text(json.dumps(prometheus, indent=2) + "\n")
+        override = {
+            "services": {
+                "app": {"environment": {
+                    "PG_URL": "jdbc:postgresql://" + postgres + ":5432/shop",
+                    "OJP_URL": "${OJP_URL:-jdbc:ojp[" + primary + ":1059]" + backend + "}",
+                }},
+                "postgres-exporter": {"environment": {
+                    "DATA_SOURCE_NAME": "postgresql://demo:${DB_PASSWORD:-demo-local-only}@"
+                    + postgres + ":5432/shop?sslmode=disable",
+                }},
+                "prometheus": {"volumes": [str(prom_file) + ":/etc/prometheus/prometheus.yml:ro"]},
+            },
+        }
+        override_file = self.output / "compose.override.json"
+        override_file.write_text(json.dumps(override, indent=2) + "\n")
+        self.env["COMPOSE_OVERRIDE_FILE"] = str(override_file)
         self.sessions = 20 if options.small else 200
         self.commands = (self.output / "commands.log").open("w", buffering=1)
 
@@ -105,7 +145,7 @@ class Environment:
         return result.stdout
 
     def compose(self, *args, **kwargs):
-        return self.run(COMPOSE + list(args), **kwargs)
+        return self.run(compose_command(self.env) + list(args), **kwargs)
 
     def sql(self, query):
         return self.compose("exec", "-T", "postgres", "sh", "-ec",
@@ -113,6 +153,8 @@ class Environment:
                             "psql", query, capture=True).strip()
 
     def service_url(self, service, port):
+        if self.bridge:
+            return f"http://{self.project}-{service}-1:{port}"
         return "http://" + self.compose("port", service, str(port), capture=True).strip()
 
     def refresh_base(self):
@@ -128,6 +170,9 @@ class Environment:
                                          headers={"Content-Type": "application/json", **(headers or {})})
         if method == "POST" and self.env.get("ADMIN_TOKEN"):
             request.add_header("Authorization", "Bearer " + self.env["ADMIN_TOKEN"])
+        if self.bridge:
+            return self.bridge.request((base or self.base) + path, data, method, timeout,
+                                       dict(request.header_items()))
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 status, body = response.status, response.read().decode()
@@ -162,10 +207,11 @@ class Environment:
 
     def runner(self, run_id, *options):
         sampler = ResourceSampler(self.output, run_id, self.env)
+        sampler.transport = self.bridge
         sampler.start()
         try:
             self.compose("--profile", "tools", "run", "--rm", "--user",
-                         f"{os.getuid()}:{os.getgid()}", "load", "--url", "http://app:8080",
+                         f"{os.getuid()}:{os.getgid()}", "load", "--url", self.env["APP_INTERNAL_URL"],
                          "--scenario", "integration", "--run-id", run_id,
                          "--output", "/results", *options)
         finally:
@@ -195,6 +241,9 @@ class Environment:
             pass
 
     def close(self):
+        if self.bridge:
+            self.bridge.close()
+            self.bridge = None
         if not self.options.keep:
             try:
                 self.compose("--profile", "ha", "--profile", "tools", "down",
@@ -510,7 +559,7 @@ class Integration(unittest.TestCase):
 
     def test_13_analytical_queries_execute_real_aggregations(self):
         def server_counts():
-            status, text = E.call("/metrics", base="http://ojp:9159")
+            status, text = E.call("/metrics", base=E.service_url("ojp", 9159))
             self.assertEqual(status, 200)
             executions = metric_rows(text, "ojp_sql_executions_total")
             slow = metric_rows(text, "ojp_sql_slow_executions_total")
@@ -691,7 +740,8 @@ class Integration(unittest.TestCase):
         name = E.project + "-controlled-http"
         try:
             E.compose("--profile", "tools", "run", "-d", "--rm", "--no-deps",
-                      "--name", name, "--entrypoint", "python", "load", "-u", "-c", DELAY_PROXY)
+                      "--name", name, "--env", "TARGET_APP_URL=" + E.env["APP_INTERNAL_URL"],
+                      "--entrypoint", "python", "load", "-u", "-c", DELAY_PROXY)
             deadline = time.monotonic() + 30
             while time.monotonic() < deadline:
                 try:
@@ -764,6 +814,7 @@ def main():
         E.run([SCRIPT / "verify-environment.sh"], timeout=60)
         E.compose("--profile", "tools", "build", "load", timeout=600)
         E.run([SCRIPT / "start.sh"], timeout=1200)
+        E.bridge = HTTPBridge(E.env)
         E.refresh_base()
         names = unittest.defaultTestLoader.getTestCaseNames(Integration)
         selected = [name for name in names if not options.only
