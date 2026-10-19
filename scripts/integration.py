@@ -754,7 +754,7 @@ class Integration(unittest.TestCase):
                 self.fail("Controlled HTTP-delay proxy did not become ready")
             results = E.runner("it-open-loop", "--url", "http://" + name + ":8080",
                                "--mode", "direct", "--rps", "20", "--warmup", "0",
-                               "--duration", "2", "--max-in-flight", "1", "--request-timeout", "5")
+                               "--duration", "2", "--max-in-flight", "1")
             self.assertEqual(len(results), 1)
             self.assertNotIn("error", results[0], results[0])
             report = results[0]["measure"]
