@@ -100,27 +100,30 @@ def parser():
                "Docker build context is the repository root.")
     result.add_argument("--url", default="http://app:8080", help="application base URL")
     result.add_argument("--mode", choices=("direct", "ojp", "both"), default="both")
-    result.add_argument("--rps", type=rates, default=rates("8,16,32,64,128,256"),
+    result.add_argument("--rps", type=rates, default=rates("16,32,64"),
                         help="ordered integer CSV rates, max 10000/64 distinct levels "
-                             "(default: 8,16,32,64,128,256)")
-    result.add_argument("--warmup", type=nonnegative_float, default=30,
-                        help="warmup arrival seconds; fully drained (default: 30)")
+                             "(default: 16,32,64)")
+    result.add_argument("--warmup", type=nonnegative_float, default=10,
+                        help="warmup arrival seconds; fully drained (default: 10)")
     result.add_argument("--warmup-only", action="store_true",
                         help="reset, check readiness, warm up and drain; never measure")
-    result.add_argument("--duration", type=positive_float, default=60,
-                        help="measurement arrival seconds, excluding drain (default: 60)")
+    result.add_argument("--duration", type=positive_float, default=10,
+                        help="measurement arrival seconds, excluding drain (default: 10)")
     result.add_argument("--max-in-flight", type=positive_int, default=512,
                         help="maximum outstanding requests AND worker threads (default: 512)")
     result.add_argument("--request-timeout", type=positive_float, default=30,
-                        help="HTTP socket timeout seconds (default: 30)")
+                        help="measured SQL request timeout seconds (default: 30)")
+    result.add_argument("--control-timeout", type=positive_float, default=210,
+                        help="mode-switch/reset/telemetry timeout seconds (default: 210)")
     result.add_argument("--readiness-timeout", type=positive_float, default=90,
                         help="maximum readiness polling seconds (default: 90)")
     result.add_argument("--seed", type=int, default=12345,
                         help="reproducible work seed (default: 12345)")
     result.add_argument("--run-id", default=uuid.uuid4().hex[:12])
-    result.add_argument("--scenario", default="death-spiral",
-                        choices=("death-spiral", "slow-queries", "failover",
-                                 "throttling", "integration"))
+    result.add_argument("--scenario", default="htap",
+                        choices=("htap", "failover", "integration"))
+    result.add_argument("--ojp-metrics-url", default="http://ojp:9159/metrics",
+                        help="OJP Prometheus endpoint used to verify real slow-query classification")
     result.add_argument("--oltp-percent", type=percentage, default=90,
                         help="integer OLTP share; rescales 30:25:20:10:5 (default: 90)")
     result.add_argument("--olap-percent", type=percentage, default=10,
@@ -195,8 +198,8 @@ def request(base_url, path, timeout, method="GET", query=None):
     return status, data, body
 
 
-def control(args, path, query=None):
-    status, data, _ = request(args.url, path, args.request_timeout, "POST", query)
+def control(args, path, query=None, timeout=None):
+    status, data, _ = request(args.url, path, timeout or args.control_timeout, "POST", query)
     if status != 200 or (isinstance(data, dict) and data.get("success") is False):
         raise RuntimeError(f"{path} failed: HTTP {status}, response={data!r}")
     return data
@@ -212,12 +215,12 @@ def is_ready(status, data):
     return data.get("status") in ("ready", "ok", "healthy", "UP", "up")
 
 
-def work(args, op, seed, phase, level):
+def work(args, op, seed, phase, level, timeout=None):
     started = time.monotonic()
     result = {"accepted": False, "sql_completed": False, "successful_transactions": False,
               "timeouts": False, "error": None}
     try:
-        status, data, _ = request(args.url, "/work", args.request_timeout, query={
+        status, data, _ = request(args.url, "/work", timeout or args.request_timeout, query={
             "op": op, "seed": seed, "phase": phase, "scenario": args.scenario, "level": level})
         result["accepted"] = (data["accepted"] is True
                               if isinstance(data, dict) and "accepted" in data
@@ -260,7 +263,7 @@ def readiness(args, level):
         try:
             for path in ("/health", "/ready"):
                 status, data, _ = request(
-                    args.url, path, min(args.request_timeout, max(.001, deadline - time.monotonic())))
+                    args.url, path, min(args.control_timeout, max(.001, deadline - time.monotonic())))
                 last[path] = {"status": status, "response": data}
                 if not is_ready(status, data):
                     break
@@ -268,7 +271,9 @@ def readiness(args, level):
                 weights = args.operation_mix or operation_weights(
                     args.oltp_percent, args.olap_percent)
                 probe = work(args, next(op for op, weight in weights.items() if weight),
-                             args.seed, "warmup", level)
+                             args.seed, "warmup", level,
+                             timeout=min(args.control_timeout,
+                                         max(.001, deadline - time.monotonic())))
                 last["work_probe"] = probe
                 if probe["successful_transactions"]:
                     return last
@@ -310,6 +315,10 @@ def run_phase(args, rps, duration, phase, level, seed, mode=None):
     histogram = [0] * (len(LATENCY_BUCKETS) + 1)
     latency_sum = 0.0
     telemetry = {"samples_sent": 0, "errors": Counter(), "final_sent": False}
+    postgres_cpu_samples = []
+    postgres_cpu_sample_times = []
+    postgres_connection_samples = []
+    postgres_connection_sample_times = []
     stop_telemetry = threading.Event()
     rng = random.Random(seed)
     weights = args.operation_mix or operation_weights(args.oltp_percent, args.olap_percent)
@@ -337,7 +346,7 @@ def run_phase(args, rps, duration, phase, level, seed, mode=None):
                             "latency_sum_seconds": latency_sum,
                             "latency_bucket_counts": ",".join(map(str, cumulative))})
         try:
-            control(args, "/arrivals", payload)
+            control(args, "/arrivals", payload, timeout=min(args.control_timeout, 10))
             telemetry["samples_sent"] += 1
             telemetry["final_sent"] = final
         except Exception as exc:
@@ -350,6 +359,28 @@ def run_phase(args, rps, duration, phase, level, seed, mode=None):
     def publish_periodically():
         while not stop_telemetry.wait(1):
             publish()
+            if phase == "measure":
+                try:
+                    sample_timeout = min(args.control_timeout, 10)
+                    ready_status, ready_data, _ = request(args.url, "/ready", sample_timeout)
+                    status, _, body = request(args.url, "/metrics", sample_timeout)
+                    if status == 200:
+                        cpu = metric_value(body, "demo_postgres_cpu_percent")
+                        sampled_at = metric_value(body, "demo_postgres_resource_timestamp_seconds")
+                        if (cpu is not None and sampled_at is not None
+                                and wall_start <= sampled_at <= wall_start + duration):
+                            postgres_cpu_samples.append(cpu)
+                            postgres_cpu_sample_times.append(sampled_at)
+                    if ready_status == 200 and isinstance(ready_data, dict):
+                        sampled_at = ready_data.get("postgres_snapshot_timestamp_seconds")
+                        physical = ready_data.get("direct_sessions" if mode == "direct" else "ojp_sessions")
+                        if (isinstance(sampled_at, (int, float))
+                                and isinstance(physical, (int, float)) and physical >= 0
+                                and wall_start <= sampled_at <= wall_start + duration):
+                            postgres_connection_samples.append(physical)
+                            postgres_connection_sample_times.append(sampled_at)
+                except (OSError, urllib.error.URLError, ValueError, KeyError, TypeError):
+                    pass
 
     def complete(future, op, scheduled):
         nonlocal latency_sum
@@ -452,19 +483,53 @@ def run_phase(args, rps, duration, phase, level, seed, mode=None):
                                if counts["dispatched"] else 0),
             "drop_fraction": counts["dropped"] / counts["scheduled"] if counts["scheduled"] else 0,
             "telemetry": telemetry,
+            "postgres_cpu_samples": postgres_cpu_samples,
+            "postgres_cpu_sample_times": postgres_cpu_sample_times,
+            "postgres_connection_samples": postgres_connection_samples,
+            "postgres_connection_sample_times": postgres_connection_sample_times,
             "scheduled_latency_histogram": {
                 "buckets": dict(zip([*map(str, LATENCY_BUCKETS), "+Inf"],
                                     itertools.accumulate(histogram))),
                 "count": counts["completed"], "sum_seconds": latency_sum},
-            "latency_ms": {kind: percentiles(values) for kind, values in combined.items()}}
+            "latency_ms": {kind: percentiles(values) for kind, values in combined.items()},
+            "oltp_latency_ms": percentiles([sample for op in OPERATIONS if op != "report"
+                                              for sample in samples[op]["end_to_end"]]),
+            "olap_latency_ms": percentiles(samples["report"]["end_to_end"])}
 
 
 def snapshot(args, path):
     try:
-        status, data, body = request(args.url, path, args.request_timeout)
+        status, data, body = request(args.url, path, min(args.control_timeout, 10))
         return {"status": status, "response": data if data is not None else body}
     except (OSError, urllib.error.URLError, ValueError) as exc:
         return {"error": str(exc)}
+
+
+def slow_query_metrics(args):
+    try:
+        status, _, body = request(args.ojp_metrics_url, "/metrics", min(args.control_timeout, 10))
+        if status != 200:
+            return None
+        totals = {}
+        pattern = re.compile(r'^ojp_sql_slow_executions_total(?:\{([^}]*)\})?\s+([0-9.eE+-]+)$')
+        for line in body.splitlines():
+            match = pattern.match(line)
+            if match:
+                labels = dict(re.findall(r'(\w+)="([^"]*)"', match.group(1) or ""))
+                statement = labels.get("sql_statement", "unlabeled")
+                totals[statement] = totals.get(statement, 0.0) + float(match.group(2))
+        return totals
+    except (OSError, urllib.error.URLError, ValueError):
+        return None
+
+
+def metric_value(text, name):
+    pattern = re.compile(r"^" + re.escape(name) + r"(?:\{[^}]*\})?\s+([0-9.eE+-]+)$")
+    for line in text.splitlines():
+        match = pattern.match(line)
+        if match:
+            return float(match.group(1))
+    return None
 
 
 def run_step(args, mode, rps, index):
@@ -472,6 +537,7 @@ def run_step(args, mode, rps, index):
     result = {"run_id": args.run_id, "scenario": args.scenario, "mode": mode, "level": level,
               "warmup_only": args.warmup_only,
               "rps": rps, "seed": args.seed, "request_timeout": args.request_timeout,
+    "control_timeout": args.control_timeout,
               "max_in_flight": args.max_in_flight,
               "counter_semantics": {
                   "accepted": "Application accepted=true if supplied, otherwise HTTP 2xx; "
@@ -485,6 +551,7 @@ def run_step(args, mode, rps, index):
                   "sql_completed": "Synchronous SQL completions, including deliberate rollback"},
               "operation_weights": args.operation_mix or operation_weights(
                   args.oltp_percent, args.olap_percent)}
+    slow_before = slow_query_metrics(args) if mode == "ojp" else None
     try:
         result["mode_response"] = control(args, "/mode", {"value": mode})
         result["warmup_reset_response"] = control(args, "/reset")
@@ -511,11 +578,62 @@ def run_step(args, mode, rps, index):
                                       args.seed + index, mode=mode)
         if result["measure"]["counts"]["sql_completed"] == 0:
             result["error"] = "measurement interval completed zero SQL operations"
+        if mode == "ojp":
+            slow_after = slow_query_metrics(args)
+            if slow_before is not None and slow_after is not None:
+                statements = sorted(set(slow_before) | set(slow_after))
+                deltas = {statement: max(0.0, slow_after.get(statement, 0.0)
+                                          - slow_before.get(statement, 0.0))
+                          for statement in statements}
+                count = sum(deltas.values())
+                result["slow_query_classification"] = {
+                    "observed": count > 0, "count": count, "by_statement": deltas,
+                    "message": ("OJP classified slow SQL during this measurement."
+                                if count > 0 else
+                                "No slow SQL classification was observed; segregation is enabled, "
+                                "but analytical-query isolation was not demonstrated.")}
+            else:
+                result["slow_query_classification"] = {
+                    "observed": None, "count": None, "by_statement": {},
+                    "message": "OJP slow-query metrics were unavailable; classification could not be verified."}
     except (OSError, urllib.error.URLError, ValueError, RuntimeError) as exc:
         result["error"] = str(exc)
     finally:
         result["readiness_after"] = snapshot(args, "/ready")
         result["metrics_after"] = snapshot(args, "/metrics")
+    report = result.get("measure")
+    if report:
+        cpu_samples = report["postgres_cpu_samples"]
+        physical_samples = report["postgres_connection_samples"]
+        cpu = sum(cpu_samples) / len(cpu_samples) if cpu_samples else None
+        physical = sum(physical_samples) / len(physical_samples) if physical_samples else None
+        if physical is not None and cpu is not None:
+            classification = result.get("slow_query_classification", {})
+            values = {
+                "mode": mode, "phase": "measure", "scenario": args.scenario, "level": level,
+                "successful_rps": report["throughput"]["successful_completions_per_second"],
+                "oltp_p95_ms": (report["oltp_latency_ms"]["p95"]
+                                if report["oltp_latency_ms"]["p95"] is not None else -1),
+                "olap_p95_ms": (report["olap_latency_ms"]["p95"]
+                                if report["olap_latency_ms"]["p95"] is not None else -1),
+                "error_percent": report["error_fraction"] * 100,
+                "dropped_requests": report["counts"]["dropped"],
+                "physical_connections": physical, "postgres_cpu_percent": cpu,
+                "slow_classifications": classification.get("count") or 0,
+            }
+            result["postgres_cpu_measurement_samples"] = len(cpu_samples)
+            result["postgres_cpu_sample_times"] = report["postgres_cpu_sample_times"]
+            result["postgres_connection_measurement_samples"] = len(physical_samples)
+            result["postgres_connection_sample_times"] = report["postgres_connection_sample_times"]
+            try:
+                result["benchmark_result_published"] = control(
+                    args, "/benchmark-result", values)
+            except (OSError, urllib.error.URLError, ValueError, RuntimeError) as exc:
+                result["benchmark_result_error"] = str(exc)
+        else:
+            result["benchmark_result_error"] = (
+                "Measured result could not be published: no PostgreSQL CPU sample overlapped the "
+                "measurement arrival window or physical connection samples were unavailable.")
     return result
 
 
@@ -565,6 +683,11 @@ def export(args, result, step):
 
 def main(argv=None):
     args = arguments(argv)
+    if (args.scenario == "htap" and args.mode in ("ojp", "both")
+            and os.environ.get("OJP_SLOW_QUERY_SEGREGATION_VERIFIED") != "true"):
+        print("ERROR: OJP HTAP requires scripts/htap.sh to verify the running server's "
+              "slow-query segregation configuration.", file=sys.stderr)
+        return 2
     safe_id = re.sub(r"[^a-zA-Z0-9_.-]", "_", args.run_id)
     if any(path.is_file() for extension in ("json", "csv")
            for path in args.output.glob(f"{safe_id}-*.{extension}")):
@@ -573,6 +696,7 @@ def main(argv=None):
         return 2
     modes = ("direct", "ojp") if args.mode == "both" else (args.mode,)
     step = 0
+    failures = []
     for mode in modes:
         for index, rps in enumerate(args.rps):
             step += 1
@@ -581,9 +705,14 @@ def main(argv=None):
             phase = "warmup" if args.warmup_only else "measure"
             print(json.dumps({"output": str(output), "mode": mode, "rps": rps,
                               "phase": phase, "counts": result.get(phase, {}).get("counts"),
+                              "slow_query_classification": result.get("slow_query_classification"),
+                              "benchmark_result_published": bool(result.get("benchmark_result_published")),
                               "error": result.get("error")}), flush=True)
             if "error" in result:
-                return 1
+                failures.append({"mode": mode, "rps": rps, "error": result["error"]})
+    if failures:
+        print(json.dumps({"benchmark_failures": failures}), file=sys.stderr, flush=True)
+        return 1
     return 0
 
 

@@ -65,9 +65,9 @@ public final class Main implements AutoCloseable {
     }
 
     private void handle(HttpExchange exchange) throws IOException {
+        String path = exchange.getRequestURI().getPath();
         try {
             Map<String, String> query = query(exchange.getRequestURI().getRawQuery());
-            String path = exchange.getRequestURI().getPath();
             switch (path) {
                 case "/health" -> {
                     method(exchange, "GET");
@@ -153,6 +153,18 @@ public final class Main implements AutoCloseable {
                     send(exchange, 200, Map.of("ok", true, "scheduled", update.scheduled(), "dispatched", update.dispatched(),
                             "dropped", update.dropped(), "inflight", update.inflight()));
                 }
+                case "/benchmark-result" -> {
+                    method(exchange, "POST");
+                    if (!authorized(exchange)) { send(exchange, 401, Map.of("error", "Admin authorization required")); return; }
+                    Metrics.Context context = context(query);
+                    metrics.benchmarkResult(query.getOrDefault("mode", ""),
+                            context, new Metrics.BenchmarkResult(
+                                    decimal(query, "successful_rps"), decimal(query, "oltp_p95_ms"),
+                                    decimal(query, "olap_p95_ms"), decimal(query, "error_percent"),
+                                    decimal(query, "dropped_requests"), decimal(query, "physical_connections"),
+                                    decimal(query, "postgres_cpu_percent"), decimal(query, "slow_classifications")));
+                    send(exchange, 200, Map.of("ok", true));
+                }
                 case "/mode", "/reset", "/context", "/rollback" -> {
                     method(exchange, "POST");
                     if (!authorized(exchange)) { send(exchange, 401, Map.of("error", "Admin authorization required")); return; }
@@ -191,10 +203,27 @@ public final class Main implements AutoCloseable {
         } catch (DisabledException e) {
             send(exchange, 404, Map.of("error", "Test endpoints disabled"));
         } catch (IllegalStateException e) {
-            send(exchange, 503, Map.of("ok", false, "error", e.getMessage()));
+            Map<String, Object> failure = new LinkedHashMap<>(
+                    Map.of("ok", false, "error", e.getMessage()));
+            if (path.equals("/mode")) {
+                Map<String, Object> diagnostic = database.diagnostics(false);
+                for (String key : List.of("state", "diagnostic", "direct_sessions",
+                        "direct_application_name", "last_error"))
+                    failure.put(key, diagnostic.get(key));
+            }
+            send(exchange, 503, failure);
         } catch (Exception e) {
             String code = e instanceof SQLException sql ? sql.getSQLState() : e.getClass().getSimpleName();
-            send(exchange, 503, Map.of("ok", false, "error", "Transaction/control failed", "code", Objects.toString(code, "unknown")));
+            Map<String, Object> failure = new LinkedHashMap<>(Map.of(
+                    "ok", false, "error", "Transaction/control failed",
+                    "code", Objects.toString(code, "unknown")));
+            if (path.equals("/mode")) {
+                Map<String, Object> diagnostic = database.diagnostics(false);
+                for (String key : List.of("state", "diagnostic", "direct_sessions",
+                        "direct_application_name", "last_error"))
+                    failure.put(key, diagnostic.get(key));
+            }
+            send(exchange, 503, failure);
         } finally { exchange.close(); }
     }
 
@@ -215,6 +244,9 @@ public final class Main implements AutoCloseable {
     }
     private static long count(Map<String, String> query, String key) {
         return Long.parseLong(query.getOrDefault(key, "0"));
+    }
+    private static double decimal(Map<String, String> query, String key) {
+        return Double.parseDouble(query.getOrDefault(key, ""));
     }
     private static Metrics.Latency latency(Map<String, String> query) {
         if (!query.containsKey("latency_bucket_counts") && !query.containsKey("latency_count")

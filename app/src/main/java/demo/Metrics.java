@@ -8,12 +8,16 @@ import java.util.concurrent.atomic.LongAdder;
 
 final class Metrics {
     static final Set<String> OPS = Set.of("browse", "history", "checkout", "review", "account", "report", "rollback", "hold");
-    static final Set<String> SCENARIOS = Set.of("death-spiral", "slow-queries", "failover", "throttling", "integration");
+    static final Set<String> SCENARIOS = Set.of("htap", "failover", "integration");
     private final Set<Double> levels = ConcurrentHashMap.newKeySet();
     private final ConcurrentHashMap<Labels, Stats> values = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<LoadLabels, Arrivals> arrivals = new ConcurrentHashMap<>();
     private volatile Map<String, Double> resources = Map.of();
-    final LongAdder opened = new LongAdder(), closed = new LongAdder(), rejected = new LongAdder();
+    private volatile Map<String, Integer> physicalConnections = Map.of("direct", -1, "ojp", -1);
+    private final Map<String, ConnectionCounts> connections = Map.of(
+            "direct", new ConnectionCounts(), "ojp", new ConnectionCounts());
+    private final ConcurrentHashMap<ResultLabels, BenchmarkResult> benchmarkResults = new ConcurrentHashMap<>();
+    final LongAdder rejected = new LongAdder();
     volatile Context context = new Context("measure", "integration", 0);
     volatile String mode = "direct";
     private volatile double measurementStartSeconds;
@@ -30,6 +34,18 @@ final class Metrics {
             return "mode=\"" + mode + "\",phase=\"" + phase
                     + "\",scenario=\"" + scenario + "\",level=\"" + levelText(level) + "\"";
         }
+    }
+    record ResultLabels(String mode, String scenario, double level) {
+        String text() {
+            return "mode=\"" + mode + "\",phase=\"measure\",scenario=\"" + scenario
+                    + "\",level=\"" + levelText(level) + "\"";
+        }
+    }
+    record BenchmarkResult(double successfulRps, double oltpP95Ms, double olapP95Ms,
+                           double errorPercent, double dropped, double physicalConnections,
+                           double postgresCpuPercent, double slowClassifications) {}
+    static final class ConnectionCounts {
+        final LongAdder opened = new LongAdder(), closed = new LongAdder();
     }
     record Latency(long count, double sumSeconds, List<Long> buckets) {
         static final String[] LIMITS = {"0.005", "0.01", "0.025", "0.05", "0.1", "0.25", "0.5", "1", "2.5", "5", "10", "30", "60", "+Inf"};
@@ -87,6 +103,35 @@ final class Metrics {
             return update;
         });
     }
+    void connectionOpened(String mode) {
+        connectionCounts(mode).opened.increment();
+    }
+    void connectionClosed(String mode) {
+        connectionCounts(mode).closed.increment();
+    }
+    long logicalOpen(String mode) {
+        ConnectionCounts counts = connectionCounts(mode);
+        return Math.max(0, counts.opened.sum() - counts.closed.sum());
+    }
+    private ConnectionCounts connectionCounts(String mode) {
+        ConnectionCounts counts = connections.get(mode);
+        if (counts == null) throw new IllegalArgumentException("mode must be direct|ojp");
+        return counts;
+    }
+    void benchmarkResult(String mode, Context context, BenchmarkResult result) {
+        if (!Set.of("direct", "ojp").contains(mode) || !context.phase.equals("measure")
+                || !Double.isFinite(result.successfulRps) || result.successfulRps < 0
+                || !Double.isFinite(result.oltpP95Ms) || result.oltpP95Ms < -1
+                || !Double.isFinite(result.olapP95Ms) || result.olapP95Ms < -1
+                || !Double.isFinite(result.errorPercent) || result.errorPercent < 0
+                || result.errorPercent > 100
+                || !Double.isFinite(result.dropped) || result.dropped < 0
+                || !Double.isFinite(result.physicalConnections) || result.physicalConnections < 0
+                || !Double.isFinite(result.postgresCpuPercent) || result.postgresCpuPercent < 0
+                || !Double.isFinite(result.slowClassifications) || result.slowClassifications < 0)
+            throw new IllegalArgumentException("Invalid measured benchmark result");
+        benchmarkResults.put(new ResultLabels(mode, context.scenario, context.level), result);
+    }
     synchronized Context context(String phase, String scenario, double level) {
         if (level == 0) level = 0;
         if (!Set.of("warmup", "measure").contains(phase) || !SCENARIOS.contains(scenario)
@@ -115,13 +160,23 @@ final class Metrics {
         resources = Map.of("postgres_cpu_percent", cpuPercent, "postgres_memory_percent", memoryPercent,
                 "postgres_resource_timestamp_seconds", System.currentTimeMillis() / 1000.0);
     }
+    void physicalConnections(int direct, int ojp) {
+        physicalConnections = Map.of("direct", direct, "ojp", ojp);
+    }
     String render(Map<String, ? extends Number> gauges) {
         StringBuilder out = new StringBuilder();
         gauges.forEach((k, v) -> out.append("demo_").append(k).append(' ').append(v).append('\n'));
         resources.forEach((k, v) -> out.append("demo_").append(k).append(' ').append(v).append('\n'));
-        out.append("demo_logical_connections_opened_total ").append(opened.sum()).append('\n')
-                .append("demo_logical_connections_closed_total ").append(closed.sum()).append('\n')
-                .append("demo_rejected_total ").append(rejected.sum()).append('\n');
+        connections.forEach((mode, counts) -> {
+            String labels = "mode=\"" + mode + "\"";
+            sample(out, "demo_logical_connections_opened_total", labels, counts.opened.sum());
+            sample(out, "demo_logical_connections_closed_total", labels, counts.closed.sum());
+            sample(out, "demo_logical_jdbc_connections_open", labels,
+                    Math.max(0, counts.opened.sum() - counts.closed.sum()));
+        });
+        physicalConnections.forEach((mode, value) ->
+                sample(out, "demo_postgres_physical_connections", "mode=\"" + mode + "\"", value));
+        out.append("demo_rejected_total ").append(rejected.sum()).append('\n');
         Context c = context;
         out.append("demo_context{mode=\"").append(mode).append("\",phase=\"").append(c.phase).append("\",scenario=\"").append(c.scenario)
                 .append("\",level=\"").append(levelText(c.level)).append("\"} 1\n");
@@ -150,9 +205,25 @@ final class Metrics {
                 if (load.latency != null) load.latency.render(out, prefix + "latency_seconds", l);
             }
         });
+        benchmarkResults.forEach((labels, result) -> {
+            String l = labels.text();
+            sample(out, "demo_benchmark_result_successful_rps", l, result.successfulRps);
+            if (result.oltpP95Ms >= 0)
+                sample(out, "demo_benchmark_result_oltp_p95_milliseconds", l, result.oltpP95Ms);
+            if (result.olapP95Ms >= 0)
+                sample(out, "demo_benchmark_result_olap_p95_milliseconds", l, result.olapP95Ms);
+            sample(out, "demo_benchmark_result_error_percent", l, result.errorPercent);
+            sample(out, "demo_benchmark_result_dropped_requests", l, result.dropped);
+            sample(out, "demo_benchmark_result_physical_connections", l, result.physicalConnections);
+            sample(out, "demo_benchmark_result_postgres_cpu_percent", l, result.postgresCpuPercent);
+            sample(out, "demo_benchmark_result_slow_classifications", l, result.slowClassifications);
+        });
         return out.toString();
     }
     private static void sample(StringBuilder out, String name, String labels, long value) {
+        out.append(name).append('{').append(labels).append("} ").append(value).append('\n');
+    }
+    private static void sample(StringBuilder out, String name, String labels, double value) {
         out.append(name).append('{').append(labels).append("} ").append(value).append('\n');
     }
     private static void counter(StringBuilder out, String name, String labels, LongAdder value) {

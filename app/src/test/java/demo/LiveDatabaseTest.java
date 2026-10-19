@@ -54,7 +54,7 @@ class LiveDatabaseTest {
                 assertEquals(orders, count(database, "orders"));
                 assertEquals(items, count(database, "order_items"));
                 assertEquals(reviews, count(database, "reviews"));
-                assertEquals(metrics.opened.sum(), metrics.closed.sum());
+                assertEquals(metrics.logicalOpen(mode), 0);
             }
         }
     }

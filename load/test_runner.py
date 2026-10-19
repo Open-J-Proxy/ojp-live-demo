@@ -8,6 +8,7 @@ import io
 import itertools
 import json
 import os
+from pathlib import Path
 import threading
 import time
 import unittest
@@ -46,6 +47,7 @@ class RunnerTests(unittest.TestCase):
         for argv in (["--rps", "0"], ["--rps", "1,,2"], ["--rps", "nan"],
                      ["--rps", "inf"], ["--duration", "-1"], ["--warmup", "-1"],
                      ["--max-in-flight", "0"], ["--request-timeout", "0"],
+                     ["--control-timeout", "0"],
                      ["--oltp-percent", "80"], ["--olap-percent", "101"],
                      ["--mode", "invalid"], ["--url", "app:8080"],
                      ["--scenario", "arbitrary"], ["--rps", "2.5"], ["--rps", "10001"],
@@ -57,9 +59,18 @@ class RunnerTests(unittest.TestCase):
                                  "--oltp-percent", "80", "--olap-percent", "20"])
         self.assertEqual(args.rps, [30, 10, 30])
         defaults = runner.arguments([])
-        self.assertEqual(defaults.rps, [8, 16, 32, 64, 128, 256])
+        self.assertEqual(defaults.rps, [16, 32, 64])
         self.assertEqual((defaults.warmup, defaults.duration, defaults.max_in_flight,
-                          defaults.seed), (30, 60, 512, 12345))
+                          defaults.seed), (10, 10, 512, 12345))
+        self.assertEqual(defaults.mode, "both")
+        self.assertEqual((defaults.oltp_percent, defaults.olap_percent), (90, 10))
+        self.assertEqual(defaults.scenario, "htap")
+        custom = runner.arguments(["--rps", "5,11", "--warmup", "3", "--duration", "7",
+                                   "--request-timeout", "9", "--control-timeout", "42",
+                                   "--max-in-flight", "23"])
+        self.assertEqual(custom.rps, [5, 11])
+        self.assertEqual((custom.warmup, custom.duration, custom.request_timeout,
+                          custom.control_timeout, custom.max_in_flight), (3, 7, 9, 42, 23))
         self.assertTrue(runner.is_ready(200, {"status": "up"}))
 
     def test_weighted_schedule(self):
@@ -73,6 +84,26 @@ class RunnerTests(unittest.TestCase):
             total = sum(weights.values())
             self.assertEqual(weights["report"] / total, (100 - oltp) / 100)
             self.assertEqual(weights["browse"] / total, oltp / 300)
+
+    def test_htap_entrypoint_enforces_segregation_and_removes_old_benchmarks(self):
+        root = Path(__file__).resolve().parent.parent
+        script = (root / "scripts" / "htap.sh").read_text()
+        self.assertIn("export SLOW_QUERY_ENABLED=true", script)
+        self.assertIn("export OJP_SLOW_QUERY_SEGREGATION_VERIFIED=true", script)
+        self.assertIn("-Dojp.server.slowQuerySegregation.enabled=true", script)
+        self.assertIn("-Dojp.server.slowQuerySegregation.slowSlotPercentage=20", script)
+        self.assertIn("run_load htap", script)
+        for old in ("death-spiral.sh", "slow-queries.sh", "throttling.sh", "compare.sh"):
+            self.assertFalse((root / "scripts" / old).exists())
+            self.assertNotIn(old, (root / "README.md").read_text())
+
+    def test_ojp_slow_query_counter_reports_observed_statement_deltas(self):
+        body = ('ojp_sql_slow_executions_total{sql_statement="select report"} 4\n'
+                'ojp_sql_slow_executions_total{sql_statement="select browse"} 2\n')
+        args = runner.arguments([])
+        with patch.object(runner, "request", return_value=(200, None, body)):
+            self.assertEqual(runner.slow_query_metrics(args),
+                             {"select report": 4, "select browse": 2})
 
     def test_nearest_rank_percentiles(self):
         self.assertIsNone(runner.percentiles([])["p99"])
@@ -419,11 +450,20 @@ class RunnerTests(unittest.TestCase):
                     patch.object(runner.Path, "glob", side_effect=existing_results), \
                     patch.object(runner, "run_step") as run_step, \
                     patch.object(runner, "export") as export, redirect_stderr(stderr):
-                status = runner.main(["--run-id", "reused/run", "--output", "results"])
+                status = runner.main(["--mode", "direct", "--run-id", "reused/run", "--output", "results"])
             self.assertEqual(status, 2)
             self.assertIn("choose a unique --run-id", stderr.getvalue())
             run_step.assert_not_called()
             export.assert_not_called()
+
+    def test_ojp_htap_runner_refuses_unverified_segregation(self):
+        with patch.dict(os.environ, {"OJP_SLOW_QUERY_SEGREGATION_VERIFIED": "false"}), \
+                patch.object(runner.Path, "glob", return_value=[]), \
+                patch.object(runner, "run_step") as run_step, \
+                redirect_stderr(io.StringIO()) as stderr:
+            self.assertEqual(runner.main(["--rps", "1"]), 2)
+        self.assertIn("requires scripts/htap.sh", stderr.getvalue())
+        run_step.assert_not_called()
 
     def test_preexisting_sampler_directory_does_not_block_run(self):
         existing_directory = MagicMock()
@@ -435,6 +475,22 @@ class RunnerTests(unittest.TestCase):
             status = runner.main(["--run-id", "sampler", "--mode", "direct", "--rps", "1"])
         self.assertEqual(status, 0)
         run_step.assert_called_once()
+
+    def test_both_modes_are_attempted_after_direct_level_failure(self):
+        calls = []
+
+        def run_step(args, mode, rps, index):
+            calls.append((mode, rps))
+            return {"error": "direct overload"} if mode == "direct" else {}
+
+        with patch.object(runner.Path, "glob", return_value=[]), \
+                patch.object(runner, "run_step", side_effect=run_step), \
+                patch.object(runner, "export", return_value=runner.Path("unused.json")), \
+                patch.dict(os.environ, {"OJP_SLOW_QUERY_SEGREGATION_VERIFIED": "true"}), \
+                redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            status = runner.main(["--mode", "both", "--rps", "7", "--output", "unused"])
+        self.assertEqual(status, 1)
+        self.assertEqual(calls, [("direct", 7), ("ojp", 7)])
 
 
 if __name__ == "__main__":
