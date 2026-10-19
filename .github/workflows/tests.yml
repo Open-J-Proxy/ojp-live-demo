@@ -3,8 +3,11 @@ name: Tests
 on:
   push:
     branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   pull_request_review:
     types: [submitted]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -12,7 +15,7 @@ permissions:
 jobs:
   java-and-python:
     if: >-
-      github.event_name == 'push' ||
+      github.event_name != 'pull_request_review' ||
       (github.event.review.state == 'approved' &&
        github.event.review.commit_id == github.event.pull_request.head.sha)
     runs-on: ubuntu-24.04
@@ -60,7 +63,7 @@ jobs:
 
   integration:
     if: >-
-      github.event_name == 'push' ||
+      github.event_name != 'pull_request_review' ||
       (github.event.review.state == 'approved' &&
        github.event.review.commit_id == github.event.pull_request.head.sha)
     runs-on: ubuntu-24.04

@@ -436,15 +436,23 @@ python3 -m unittest discover -s load -p 'test_*.py'
 docker compose config --quiet
 ```
 
-The [Tests workflow](.github/workflows/tests.yml) runs on every push to `main`
-and when a PR review is submitted as **Approved** for the current PR head commit.
+The [Tests workflow](.github/workflows/tests.yml) runs on every push to `main`,
+when a PR is opened, updated, reopened, or marked ready for review (including
+draft PR updates), and when a PR review is submitted as **Approved** for the
+current PR head commit.
 It runs the Python runner tests, Maven verification with `LIVE_DB_TESTS=true`
 against PostgreSQL and OJP, and the full 22-scenario integration suite with
 200 direct sessions (not `--small`). Test reports and integration evidence are
 uploaded as Actions artifacts, including on failure.
-New PR commits need a new approval to run; comment-only and changes-requested
-reviews skip the test jobs. Fork PRs may also require a maintainer to approve
-the Actions run under repository settings.
+Find runs in the PR's **Checks** tab or **Actions → Tests**. Users with write
+access can rerun completed runs via **Re-run all jobs**. Once this workflow
+exists on the default branch (`main`), **Actions → Tests → Run workflow**
+also allows manual runs on a selected branch via `workflow_dispatch`.
+GitHub does not show that manual-run button for a workflow that exists only
+in an unmerged PR; PR events provide checks before that first merge.
+Comment-only and changes-requested reviews skip the review-triggered test jobs.
+Fork PRs may also require a maintainer to approve the Actions run under
+repository settings.
 PR code runs on GitHub-hosted runners with read-only repository permissions,
 without persisted checkout credentials or repository secrets.
 
