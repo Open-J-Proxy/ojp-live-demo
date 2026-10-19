@@ -436,6 +436,18 @@ python3 -m unittest discover -s load -p 'test_*.py'
 docker compose config --quiet
 ```
 
+The [Tests workflow](.github/workflows/tests.yml) runs on every push to `main`
+and when a PR review is submitted as **Approved** for the current PR head commit.
+It runs the Python runner tests, Maven verification with `LIVE_DB_TESTS=true`
+against PostgreSQL and OJP, and the full 22-scenario integration suite with
+200 direct sessions (not `--small`). Test reports and integration evidence are
+uploaded as Actions artifacts, including on failure.
+New PR commits need a new approval to run; comment-only and changes-requested
+reviews skip the test jobs. Fork PRs may also require a maintainer to approve
+the Actions run under repository settings.
+PR code runs on GitHub-hosted runners with read-only repository permissions,
+without persisted checkout credentials or repository secrets.
+
 The JAR includes dependencies and JDBC service entries via Maven Shade's
 `ServicesResourceTransformer` and sets `Main-Class: demo.Main` via
 `ManifestResourceTransformer`. Integration runs the packaged container rather
