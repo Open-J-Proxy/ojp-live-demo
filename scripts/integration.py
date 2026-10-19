@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Real-container integration tests. Uses only the Python standard library."""
 import argparse
+import base64
 from concurrent.futures import ThreadPoolExecutor
+import csv
 import json
 import math
 import os
@@ -15,11 +17,40 @@ import unittest
 import urllib.error
 import urllib.parse
 import urllib.request
+from resources import ResourceSampler
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "scripts"
 COMPOSE = ["docker", "compose", "--project-directory", str(ROOT), "-f", str(ROOT / "compose.yaml")]
 TABLES = ("users", "products", "orders", "order_items", "reviews")
+DELAY_PROXY = r'''
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import time, urllib.request, urllib.error
+class Proxy(BaseHTTPRequestHandler):
+    def log_message(self, *args): pass
+    def forward(self):
+        if self.path.startswith("/work?"):
+            time.sleep(.25)
+        data = self.rfile.read(int(self.headers.get("Content-Length", "0"))) if self.command == "POST" else None
+        headers = {}
+        if self.headers.get("Authorization"):
+            headers["Authorization"] = self.headers["Authorization"]
+        request = urllib.request.Request("http://app:8080" + self.path, data=data,
+                                         method=self.command, headers=headers)
+        try:
+            response = urllib.request.urlopen(request, timeout=60)
+        except urllib.error.HTTPError as error:
+            response = error
+        with response:
+            body = response.read()
+            self.send_response(response.code)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+    do_GET = forward
+    do_POST = forward
+ThreadingHTTPServer(("0.0.0.0", 8080), Proxy).serve_forever()
+'''
 
 
 def metric_rows(text, name):
@@ -45,9 +76,11 @@ class Environment:
             "TEST_ENDPOINTS": "true", "DIRECT_POOL_SIZE": "20" if options.small else "200",
             "HTTP_WORKERS": "512",
             "PG_MAX_CONNECTIONS": "300", "START_TIMEOUT": "300",
+            "SLOW_QUERY_ENABLED": "true", "SLOW_QUERY_THRESHOLD_MS": "1",
             "SEED_USERS": "200", "SEED_PRODUCTS": "100", "SEED_ORDERS": "1000",
             "SEED_ITEMS": "3000", "SEED_REVIEWS": "500", "SEED": "12345",
             "RESULTS_DIR": str(self.output),
+            "LOCAL_UID": str(os.getuid()), "LOCAL_GID": str(os.getgid()),
         })
         for name in ("APP_PORT", "POSTGRES_PORT", "PROMETHEUS_PORT", "GRAFANA_PORT"):
             self.env[name] = "0"
@@ -89,10 +122,12 @@ class Environment:
         query = "SELECT " + ", ".join(f"(SELECT count(*) FROM {table})" for table in TABLES)
         return tuple(map(int, self.sql(query).split("|")))
 
-    def call(self, path, data=None, method=None, timeout=60, base=None):
+    def call(self, path, data=None, method=None, timeout=60, base=None, headers=None):
         raw = None if data is None else json.dumps(data).encode()
         request = urllib.request.Request((base or self.base) + path, data=raw, method=method,
-                                         headers={"Content-Type": "application/json"})
+                                         headers={"Content-Type": "application/json", **(headers or {})})
+        if method == "POST" and self.env.get("ADMIN_TOKEN"):
+            request.add_header("Authorization", "Bearer " + self.env["ADMIN_TOKEN"])
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 status, body = response.status, response.read().decode()
@@ -126,10 +161,15 @@ class Environment:
         return body
 
     def runner(self, run_id, *options):
-        self.compose("--profile", "tools", "run", "--rm", "--user",
-                     f"{os.getuid()}:{os.getgid()}", "load", "--url", "http://app:8080",
-                     "--scenario", "integration", "--run-id", run_id,
-                     "--output", "/results", *options)
+        sampler = ResourceSampler(self.output, run_id, self.env)
+        sampler.start()
+        try:
+            self.compose("--profile", "tools", "run", "--rm", "--user",
+                         f"{os.getuid()}:{os.getgid()}", "load", "--url", "http://app:8080",
+                         "--scenario", "integration", "--run-id", run_id,
+                         "--output", "/results", *options)
+        finally:
+            sampler.stop()
         results = [json.loads(path.read_text())
                    for path in sorted(self.output.glob(run_id + "-*.json"))]
         if not results:
@@ -184,6 +224,19 @@ class Integration(unittest.TestCase):
         self.assertNotEqual(body.get("sql_completed"), False, body)
         return body
 
+    def test_00_infrastructure(self):
+        text = E.compose("ps", "--format", "json", capture=True)
+        services = []
+        for line in text.splitlines():
+            value = json.loads(line)
+            services.extend(value if isinstance(value, list) else [value])
+        running = {item["Service"] for item in services if item["State"] == "running"}
+        self.assertTrue({"postgres", "ojp", "app", "prometheus", "grafana",
+                         "postgres-exporter"}.issubset(running), services)
+        self.assertEqual(E.sql("SELECT 1"), "1")
+        self.assertEqual(E.call("/health")[0], 200)
+        self.assertTrue(E.call("/ready")[1]["ready"])
+
     def test_01_seed_cardinality_and_foreign_keys(self):
         E.reset()
         self.assertEqual(E.counts(), (200, 100, 1000, 3000, 500))
@@ -191,6 +244,13 @@ class Integration(unittest.TestCase):
                          "12345|200|100|1000|3000|500")
         self.assertEqual(E.sql("SELECT count(*) FROM order_items i LEFT JOIN orders o ON o.id=i.order_id "
                                "LEFT JOIN products p ON p.id=i.product_id WHERE o.id IS NULL OR p.id IS NULL"), "0")
+        self.assertEqual(E.sql("SELECT count(*) FROM pg_constraint WHERE connamespace='public'::regnamespace "
+                               "AND contype='f' AND convalidated"), "5")
+        indexes = set(E.sql("SELECT indexname FROM pg_indexes WHERE schemaname='public'").splitlines())
+        self.assertTrue({"orders_user_date", "orders_date", "items_order", "items_product",
+                         "reviews_product", "reviews_user", "products_price"}.issubset(indexes), indexes)
+        self.assertEqual(E.sql("SELECT count(*) FROM pg_constraint WHERE connamespace='public'::regnamespace "
+                               "AND contype='c' AND convalidated"), "4")
         E.run([SCRIPT / "seed-data.sh"])
         self.assertEqual(E.counts(), (200, 100, 1000, 3000, 500))
 
@@ -202,13 +262,18 @@ class Integration(unittest.TestCase):
             self.success(E.work("browse"))
         status, _ = E.call("/mode?value=invalid", {}, "POST")
         self.assertEqual(status, 400)
+        E.run([SCRIPT / "verify-connections.sh"])
 
     def test_03_all_read_operations_both_modes(self):
+        rows = {}
         for mode in ("direct", "ojp"):
             E.mode(mode)
+            E.reset()
+            rows[mode] = {}
             for op in ("browse", "history", "account", "report"):
                 with self.subTest(mode=mode, operation=op):
-                    self.success(E.work(op))
+                    rows[mode][op] = self.success(E.work(op))["rows"]
+        self.assertEqual(rows["direct"], rows["ojp"], "Same baseline/seed must return consistent SQL row counts")
 
     def test_04_committed_checkout_review_counts(self):
         for mode in ("direct", "ojp"):
@@ -236,7 +301,7 @@ class Integration(unittest.TestCase):
 
     def test_06_reset_restores_replay_baseline(self):
         E.mode("direct")
-        E.reset()
+        E.run([SCRIPT / "reset.sh"])
         baseline = E.counts()
         for _ in range(2):
             self.success(E.work("checkout", seed=9876))
@@ -251,6 +316,7 @@ class Integration(unittest.TestCase):
         physical = int(E.sql("SELECT count(*) FROM pg_stat_activity WHERE "
                              "datname=current_database() AND application_name='demo-direct'"))
         self.assertEqual(physical, expected_pool)
+        opened_before = metric_rows(E.metrics(), "demo_logical_connections_opened_total")[0][1]
         barrier = threading.Barrier(E.sessions + 1)
         def hold():
             barrier.wait(timeout=30)
@@ -274,6 +340,8 @@ class Integration(unittest.TestCase):
             "physical_sessions": physical, "small_profile": E.options.small}))
         self.assertGreaterEqual(peak, E.sessions,
                                 f"Expected {E.sessions} simultaneous HTTP handlers, observed {peak}")
+        self.assertEqual(metric_rows(E.metrics(), "demo_logical_connections_opened_total")[0][1],
+                         opened_before, "/hold must not manufacture database work")
 
     def test_08_logical_connection_lifecycle_balanced(self):
         for mode in ("direct", "ojp"):
@@ -289,27 +357,47 @@ class Integration(unittest.TestCase):
 
     def test_09_ojp_multiplexes_bounded_physical_pool(self):
         E.mode("ojp")
+        self.assertEqual(E.sql("SELECT count(*) FROM pg_stat_activity WHERE application_name='demo-direct'"), "0")
+        for name in ("demo_hikari_total", "demo_hikari_active", "demo_hikari_idle"):
+            self.assertEqual(metric_rows(E.metrics(), name)[0][1], 0)
         concurrency = 60 if not E.options.small else 20
         barrier = threading.Barrier(concurrency + 1)
         def hold():
             barrier.wait(timeout=30)
             return E.work("report", scenario="slow-queries")
         peak = 0
+        successes = rejected = 0
+        def completed():
+            return sum(value for labels, value in metric_rows(E.metrics(), "demo_completions_total")
+                       if labels.get("mode") == "ojp" and labels.get("op") == "report"
+                       and labels.get("scenario") == "slow-queries")
+        before_completed = completed()
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
             futures = [executor.submit(hold) for _ in range(concurrency)]
             barrier.wait(timeout=30)
             while not all(future.done() for future in futures):
                 peak = max(peak, int(E.sql("SELECT count(*) FROM pg_stat_activity WHERE "
-                                          "datname=current_database() AND wait_event='PgSleep'")))
+                                          "datname=current_database() AND application_name='demo-ojp'")))
                 time.sleep(.1)
             for future in futures:
-                self.success(future.result())
-        self.assertGreater(peak, 0)
+                status, body = future.result()
+                if status == 200:
+                    self.success((status, body))
+                    successes += 1
+                else:
+                    self.assertEqual(status, 503, body)
+                    self.assertEqual(body.get("code"), "08001", body)
+                    rejected += 1
+        self.assertGreaterEqual(peak, 10)
+        self.assertGreater(successes, 0)
+        self.assertEqual(successes + rejected, concurrency)
+        self.assertEqual(completed() - before_completed, successes)
         self.assertLessEqual(peak, 40)
         if not E.options.small:
             self.assertLess(peak, concurrency)
         (E.output / "ojp-sessions.json").write_text(json.dumps({
-            "logical_concurrency": concurrency, "physical_peak": peak, "physical_limit": 40}))
+            "logical_concurrency": concurrency, "physical_peak": peak, "physical_limit": 40,
+            "sql_successes": successes, "pool_acquisition_rejections": rejected}))
 
     def test_10_phase_histograms_and_level_sql_completions(self):
         E.mode("direct")
@@ -334,15 +422,31 @@ class Integration(unittest.TestCase):
 
     def test_11_ordered_sequential_comparison_and_metadata(self):
         results = E.runner("it-compare", "--mode", "both", "--rps", "3,7",
-                           "--warmup", "1", "--duration", "2", "--seed", "12345")
+                           "--warmup", "1", "--duration", "2", "--seed", "4242",
+                           "--max-in-flight", "17", "--request-timeout", "45")
         self.assertEqual([(item["mode"], item["rps"]) for item in results],
                          [("direct", 3), ("direct", 7), ("ojp", 3), ("ojp", 7)])
         for item in results:
             self.assertNotIn("error", item, item)
-            self.assertEqual(item["seed"], 12345)
+            self.assertEqual(item["seed"], 4242)
+            self.assertEqual(item["max_in_flight"], 17)
+            self.assertEqual(item["request_timeout"], 45)
             self.assertEqual(item["scenario"], "integration")
             self.assertEqual(item["run_id"], "it-compare")
+            self.assertEqual(item["readiness_before_measure"]["/health"]["status"], 200)
+            self.assertEqual(item["readiness_before_measure"]["/ready"]["status"], 200)
+            self.assertTrue(item["readiness_before_measure"]["work_probe"]["sql_completed"])
+            self.assertEqual(item["readiness_after"]["status"], 200)
+            self.assertEqual(item["metrics_before_measure"]["status"], 200)
+            self.assertEqual(item["metrics_after"]["status"], 200)
             for phase, duration in (("warmup", 1), ("measure", 2)):
+                report = item[phase]
+                self.assertLessEqual(report["start_epoch_seconds"], report["end_arrivals_epoch_seconds"])
+                self.assertLessEqual(report["end_arrivals_epoch_seconds"], report["end_epoch_seconds"])
+                self.assertAlmostEqual(report["end_arrivals_epoch_seconds"] - report["start_epoch_seconds"],
+                                       duration, places=4)
+                self.assertTrue(report["start_time"].endswith("Z"))
+                self.assertTrue(report["end_time"].endswith("Z"))
                 counts = item[phase]["counts"]
                 self.assertEqual(counts["scheduled"], math.ceil(item["rps"] * duration))
                 self.assertEqual(counts["sql_completed"], counts["scheduled"])
@@ -350,6 +454,18 @@ class Integration(unittest.TestCase):
                 self.assertEqual(counts["failed_transactions"], 0)
                 self.assertEqual(counts["in_flight"], 0)
                 self.assertIsNotNone(item[phase]["latency_ms"]["end_to_end"]["p99"])
+                telemetry = item[phase]["telemetry"]
+                self.assertTrue(telemetry["final_sent"], telemetry)
+                self.assertGreater(telemetry["samples_sent"], 0)
+                self.assertFalse(telemetry["errors"], telemetry)
+                histogram = item[phase]["scheduled_latency_histogram"]
+                self.assertEqual(histogram["count"], counts["completed"])
+                self.assertEqual(histogram["count"], counts["dispatched"])
+                self.assertEqual(histogram["buckets"]["+Inf"], histogram["count"])
+                ordered = [value for _, value in sorted(
+                    histogram["buckets"].items(), key=lambda pair: float(pair[0]))]
+                self.assertEqual(ordered, sorted(ordered))
+                self.assertGreaterEqual(histogram["sum_seconds"], 0)
             def sql_completions(snapshot):
                 return sum(value for labels, value in metric_rows(
                     snapshot["response"], "demo_completions_total")
@@ -362,6 +478,17 @@ class Integration(unittest.TestCase):
                              "Per-level application SQL completions must match runner completions")
             csv_file = E.output / f"it-compare-{results.index(item)+1:03d}-{item['mode']}-{item['level']}.csv"
             self.assertTrue(csv_file.exists(), csv_file)
+            with csv_file.open(newline="") as stream:
+                rows = list(csv.DictReader(stream))
+            self.assertEqual(len(rows), 14)
+            self.assertEqual({row["phase"] for row in rows}, {"warmup", "measure"})
+            for row in rows:
+                self.assertEqual(row["mode"], item["mode"])
+                self.assertEqual(row["run_id"], item["run_id"])
+                self.assertEqual(row["start_time"], item[row["phase"]]["start_time"])
+                if row["operation"] == "all":
+                    self.assertEqual(int(row["sql_completed"]),
+                                     item[row["phase"]]["counts"]["sql_completed"])
         for direct, ojp in zip(results[:2], results[2:]):
             self.assertEqual(
                 {op: value["scheduled"] for op, value in direct["measure"]["operations"].items()},
@@ -381,31 +508,87 @@ class Integration(unittest.TestCase):
         self.assertEqual(counts["accepted"], counts["sql_completed"])
         self.assertLess(counts["sql_completed"], counts["scheduled"])
 
-    def test_13_slow_queries_execute_real_sql_delay(self):
+    def test_13_analytical_queries_execute_real_aggregations(self):
+        def server_counts():
+            status, text = E.call("/metrics", base="http://ojp:9159")
+            self.assertEqual(status, 200)
+            executions = metric_rows(text, "ojp_sql_executions_total")
+            slow = metric_rows(text, "ojp_sql_slow_executions_total")
+            self.assertTrue(executions, "Missing actual OJP SQL execution counter")
+            return sum(v for _, v in executions), sum(v for _, v in slow) if slow else None
         E.mode("ojp")
-        start = time.monotonic()
-        self.success(E.work("report", scenario="slow-queries"))
-        elapsed = time.monotonic() - start
-        self.assertGreaterEqual(elapsed, .1, "Slow scenario must contain an actual SQL delay")
-        self.assertLess(elapsed, 60)
-        E.reset()
+        before_server = server_counts()
+        result_rows = {}
+        for mode in ("direct", "ojp"):
+            E.mode(mode)
+            E.reset()
+            before = sum(value for labels, value in metric_rows(E.metrics(), "demo_completions_total")
+                         if labels.get("mode") == mode and labels.get("op") == "report"
+                         and labels.get("scenario") == "slow-queries")
+            result = self.success(E.work("report", scenario="slow-queries"))
+            result_rows[mode] = result["rows"]
+            self.assertGreater(result["rows"], 0, "Sales aggregation must return real product groups")
+            after = sum(value for labels, value in metric_rows(E.metrics(), "demo_completions_total")
+                        if labels.get("mode") == mode and labels.get("op") == "report"
+                        and labels.get("scenario") == "slow-queries")
+            self.assertEqual(after - before, 1)
+            E.reset()
+        self.assertEqual(result_rows["direct"], result_rows["ojp"])
+        after_server = server_counts()
+        self.assertGreater(after_server[0], before_server[0])
+        if after_server[1] is not None:
+            self.assertGreaterEqual(after_server[1], before_server[1] or 0)
+            self.assertLessEqual(after_server[1], after_server[0])
+        else:
+            self.assertIsNone(before_server[1])
+        (E.output / "ojp-sql-classification.json").write_text(json.dumps({
+            "configured_threshold_ms": 1, "before": before_server, "after": after_server,
+            "note": "Absent slow series means no observed classifications; no latency/sleep guarantee."
+        }, indent=2) + "\n")
 
     def test_14_monitoring_targets_and_exported_data(self):
+        resource_path = E.output / "it-compare" / "resources.jsonl"
+        if resource_path.exists():
+            records = [json.loads(line) for line in resource_path.read_text().splitlines()]
+            postgres = [row for row in records if row.get("stats", {}).get("Name", "").endswith("-postgres-1")]
+            self.assertTrue(postgres, "No real PostgreSQL Docker resource statistics")
+            self.assertTrue(any(
+                interval["phase"] == "measure" and interval["arrival_window_overlap"]
+                for row in postgres for interval in row.get("workload_intervals", [])),
+                "No PostgreSQL CPU sample overlaps an actual measurement arrival window")
+            for row in postgres:
+                self.assertEqual(row["source"], "docker_stats")
+                self.assertIn("timestamp", row)
+                self.assertGreaterEqual(float(row["stats"]["CPUPerc"].removesuffix("%")), 0)
+                self.assertIn("MemUsage", row["stats"])
+        elif not E.options.only:
+            self.fail("Comparison did not persist PostgreSQL CPU evidence")
         prometheus = E.service_url("prometheus", 9090)
         grafana = E.service_url("grafana", 3000)
         self.assertEqual(E.call("/api/health", base=grafana)[0], 200)
+        credentials = (E.env.get("GRAFANA_USER", "admin") + ":"
+                       + E.env.get("GRAFANA_PASSWORD", "demo-local-only"))
+        authorization = "Basic " + base64.b64encode(credentials.encode()).decode()
+        status, dashboard = E.call("/api/dashboards/uid/ojp-benchmark", base=grafana,
+                                   headers={"Authorization": authorization})
+        self.assertEqual(status, 200, dashboard)
+        self.assertEqual(dashboard["dashboard"]["uid"], "ojp-benchmark")
+        self.assertTrue(dashboard["dashboard"]["panels"])
         deadline = time.monotonic() + 90
         targets = []
+        required_jobs = {"app", "postgres", "ojp", "prometheus"}
         while time.monotonic() < deadline:
             status, body = E.call("/api/v1/targets", base=prometheus)
             self.assertEqual(status, 200, body)
             targets = body["data"]["activeTargets"]
-            jobs = {target["labels"].get("job"): target["health"] for target in targets}
-            if len(targets) >= 3 and all(value == "up" for value in jobs.values()):
+            jobs = {target["labels"].get("job"): target["health"] for target in targets
+                    if target["labels"].get("job") in required_jobs}
+            if required_jobs.issubset(jobs) and all(value == "up" for value in jobs.values()):
                 break
             time.sleep(2)
-        self.assertGreaterEqual(len(targets), 3, targets)
-        self.assertTrue(all(target["health"] == "up" for target in targets), targets)
+        self.assertTrue(required_jobs.issubset(jobs), targets)
+        self.assertTrue(all(value == "up" for value in jobs.values()), targets)
+        (E.output / "prometheus-targets.json").write_text(json.dumps(targets, indent=2) + "\n")
         status, body = E.call("/api/v1/query?" + urllib.parse.urlencode({
             "query": "sum(demo_completions_total)"}), base=prometheus)
         self.assertEqual(status, 200, body)
@@ -418,6 +601,9 @@ class Integration(unittest.TestCase):
         E.refresh_base()
         report = json.loads((E.output / "it-failover-failover-events.json").read_text())
         self.assertTrue(report["success"], report)
+        self.assertEqual({node["service"] for node in report["ha_nodes_before_fault"]},
+                         {"ojp", "ojp2", "ojp3"})
+        self.assertTrue(all(node["state"] == "running" for node in report["ha_nodes_before_fault"]))
         self.assertIn("fault_requested_at", report)
         self.assertIn("node_stopped_at", report)
         self.assertIn("recovered_at", report)
@@ -428,6 +614,128 @@ class Integration(unittest.TestCase):
         state = E.compose("ps", "--format", "json", "ojp", capture=True)
         self.assertIn("running", state.lower())
 
+    def assert_mode_isolation(self, item):
+        readiness = item["readiness_before_measure"]["/ready"]["response"]
+        self.assertEqual(readiness["mode"], item["mode"])
+        expected = 0 if item["mode"] == "ojp" else int(E.env["DIRECT_POOL_SIZE"])
+        self.assertEqual(readiness["direct_sessions"], expected)
+        for name in ("demo_hikari_total", "demo_hikari_active", "demo_hikari_idle"):
+            values = metric_rows(item["metrics_before_measure"]["response"], name)
+            self.assertTrue(values, name)
+            if item["mode"] == "ojp":
+                self.assertEqual(values[0][1], 0, name)
+
+    def check_ramp(self, mode):
+        duration = E.options.ramp_duration
+        results = E.runner("it-ramp-" + mode, "--mode", mode, "--rps", "2,4,8",
+                           "--warmup", "1", "--duration", str(duration))
+        self.assertEqual([item["rps"] for item in results], [2, 4, 8])
+        for item in results:
+            self.assertNotIn("error", item, item)
+            self.assertEqual(item["mode"], mode)
+            counts = item["measure"]["counts"]
+            self.assertEqual(counts["scheduled"], math.ceil(item["rps"] * duration))
+            self.assertEqual(counts["sql_completed"], counts["scheduled"])
+            self.assertEqual(counts["successful_transactions"], counts["scheduled"])
+            self.assertEqual(counts["failed_transactions"], 0)
+            self.assertEqual(counts["in_flight"], 0)
+            self.assert_mode_isolation(item)
+
+    def test_16_direct_ordered_ramp(self):
+        self.check_ramp("direct")
+
+    def test_17_ojp_ordered_ramp_and_mode_isolation(self):
+        self.check_ramp("ojp")
+
+    def test_18_completed_workload_proportions(self):
+        results = E.runner("it-proportions", "--mode", "both", "--rps", "20",
+                           "--warmup", "1", "--duration", "5", "--oltp-percent", "90",
+                           "--olap-percent", "10", "--seed", "12345")
+        self.assertEqual([item["mode"] for item in results], ["direct", "ojp"])
+        for item in results:
+            self.assertNotIn("error", item, item)
+            counts = item["measure"]["counts"]
+            self.assertEqual(counts["scheduled"], 100)
+            self.assertEqual(counts["sql_completed"], 100)
+            self.assertEqual(counts["successful_transactions"], 100)
+            operations = item["measure"]["operations"]
+            self.assertEqual(operations["report"]["sql_completed"], 10)
+            self.assertEqual(sum(value["sql_completed"] for name, value in operations.items()
+                                 if name != "report"), 90)
+            self.assert_mode_isolation(item)
+            def phase_total(snapshot, phase):
+                return sum(value for labels, value in metric_rows(snapshot["response"], "demo_completions_total")
+                           if labels.get("mode") == item["mode"] and labels.get("phase") == phase
+                           and labels.get("level") == item["level"]
+                           and labels.get("scenario") == item["scenario"])
+            before, after = item["metrics_before_measure"], item["metrics_after"]
+            self.assertEqual(phase_total(after, "measure") - phase_total(before, "measure"), 100)
+            self.assertEqual(phase_total(after, "warmup"), phase_total(before, "warmup"))
+
+    def test_19_warmup_only_excludes_measurements(self):
+        def measured():
+            return sum(value for labels, value in metric_rows(E.metrics(), "demo_completions_total")
+                       if labels.get("phase") == "measure")
+        before = measured()
+        results = E.runner("it-warmup-only", "--mode", "direct", "--rps", "2",
+                           "--warmup", "1", "--warmup-only")
+        self.assertEqual(len(results), 1)
+        item = results[0]
+        self.assertNotIn("error", item, item)
+        self.assertNotIn("measure", item)
+        self.assertEqual(item["warmup"]["counts"]["scheduled"], 2)
+        self.assertEqual(item["warmup"]["counts"]["sql_completed"], 2)
+        self.assertEqual(measured(), before)
+
+    def test_20_independent_open_loop_arrivals(self):
+        name = E.project + "-controlled-http"
+        try:
+            E.compose("--profile", "tools", "run", "-d", "--rm", "--no-deps",
+                      "--name", name, "--entrypoint", "python", "load", "-u", "-c", DELAY_PROXY)
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                try:
+                    if E.call("/health", base="http://" + name + ":8080", timeout=3)[0] == 200:
+                        break
+                except OSError:
+                    pass
+                time.sleep(.2)
+            else:
+                self.fail("Controlled HTTP-delay proxy did not become ready")
+            results = E.runner("it-open-loop", "--url", "http://" + name + ":8080",
+                               "--mode", "direct", "--rps", "20", "--warmup", "0",
+                               "--duration", "2", "--max-in-flight", "1", "--request-timeout", "5")
+            self.assertEqual(len(results), 1)
+            self.assertNotIn("error", results[0], results[0])
+            report = results[0]["measure"]
+            counts = report["counts"]
+            self.assertEqual(counts["scheduled"], 40, "Arrivals must not wait for preceding responses")
+            self.assertGreater(counts["dropped"], 20)
+            self.assertGreater(counts["sql_completed"], 0)
+            self.assertEqual(counts["sql_completed"], counts["dispatched"])
+            self.assertEqual(counts["scheduled"], counts["dispatched"] + counts["dropped"])
+            self.assertEqual(counts["peak_in_flight"], 1)
+            self.assertGreaterEqual(report["latency_ms"]["end_to_end"]["p50"], 250)
+            self.assertLess(report["elapsed_seconds"], 4)
+        finally:
+            E.run(["docker", "rm", "-f", name], check=False)
+
+    def test_21_invalid_cli_parameters(self):
+        invalid = (
+            ["--rps", "0"], ["--rps", "-1"], ["--rps", "2,2.5"], ["--rps", "10001"],
+            ["--rps", ",".join(map(str, range(1, 66)))], ["--warmup", "-1"],
+            ["--duration", "0"], ["--max-in-flight", "0"], ["--request-timeout", "nan"],
+            ["--duration", "inf"], ["--oltp-percent", "90", "--olap-percent", "20"],
+            ["--mode", "invalid"], ["--scenario", "invalid"],
+        )
+        for arguments in invalid:
+            with self.subTest(arguments=arguments):
+                command = [sys.executable, str(ROOT / "load" / "runner.py"), *arguments]
+                result = subprocess.run(command, cwd=ROOT, env=E.env, capture_output=True,
+                                        text=True, timeout=15)
+                E.commands.write("$ " + " ".join(command) + "\n" + result.stderr)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+
 
 def main():
     global E
@@ -435,8 +743,13 @@ def main():
     parser.add_argument("--keep", action="store_true")
     parser.add_argument("--small", action="store_true",
                         default=os.environ.get("IT_SMALL", "").lower() == "true")
-    parser.add_argument("--only", help="Run matching test names; default runs all 15")
+    parser.add_argument("--only", action="append",
+                        help="Run matching test names; repeat to select related tests; default runs the full suite")
+    parser.add_argument("--ramp-duration", type=float, default=float(os.environ.get("IT_RAMP_DURATION", "10")),
+                        help="Seconds per 2,4,8 RPS ramp level (default 10, or IT_RAMP_DURATION)")
     options = parser.parse_args()
+    if not math.isfinite(options.ramp_duration) or options.ramp_duration <= 0:
+        parser.error("--ramp-duration must be positive and finite")
     E = Environment(options)
     print(f"Project: {E.project}; evidence: {E.output}", flush=True)
     if options.small:
@@ -449,11 +762,12 @@ def main():
             if script.name != "common.sh":
                 E.run([script, "--help"], timeout=20)
         E.run([SCRIPT / "verify-environment.sh"], timeout=60)
+        E.compose("--profile", "tools", "build", "load", timeout=600)
         E.run([SCRIPT / "start.sh"], timeout=1200)
         E.refresh_base()
-        E.compose("--profile", "tools", "build", "load", timeout=600)
         names = unittest.defaultTestLoader.getTestCaseNames(Integration)
-        selected = [name for name in names if not options.only or options.only in name]
+        selected = [name for name in names if not options.only
+                    or any(fragment in name for fragment in options.only)]
         if not selected:
             raise RuntimeError("--only did not match any integration scenario")
         suite = unittest.TestSuite(Integration(name) for name in selected)

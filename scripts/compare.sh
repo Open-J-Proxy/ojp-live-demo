@@ -7,4 +7,4 @@ Runs --mode both sequentially with baseline reset and equal seeded request plans
 All options are forwarded; specify --rps CSV --warmup N --duration N as needed.'
   exit 0
 fi
-run_load compare --mode both "$@"
+run_load death-spiral --mode both "$@"

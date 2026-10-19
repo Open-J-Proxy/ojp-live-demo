@@ -14,6 +14,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from resources import ResourceSampler
 
 ROOT = Path(__file__).resolve().parent.parent
 COMPOSE = ["docker", "compose", "--project-directory", str(ROOT), "-f", str(ROOT / "compose.yaml")]
@@ -68,6 +69,14 @@ def main():
     if (not all(map(math.isfinite, (args.recovery_timeout, args.duration, args.warmup)))
             or args.recovery_timeout <= 0 or args.duration < 3 or args.warmup < 0):
         parser.error("recovery timeout must be positive, duration >= 3 and warmup >= 0")
+    sys.path.insert(0, str(ROOT / "load"))
+    from runner import arguments as load_arguments
+    validated = load_arguments([
+        "--mode", "ojp", "--scenario", args.scenario, "--run-id", args.run_id,
+        "--warmup", str(args.warmup), "--duration", str(args.duration), *forwarded,
+    ])
+    if validated.warmup_only:
+        parser.error("failover requires measurement; --warmup-only is not supported")
     output = Path(os.environ.get("RESULTS_DIR", ROOT / "results"))
     output.mkdir(parents=True, exist_ok=True)
     safe_id = "".join(c if c.isalnum() or c in "._-" else "_" for c in args.run_id)
@@ -83,6 +92,7 @@ def main():
     process = None
     log = None
     failure = None
+    sampler = ResourceSampler(output, args.run_id)
     try:
         subprocess.run(COMPOSE + ["--profile", "ha", "up", "-d", "ojp", "ojp2", "ojp3"],
                        check=True)
@@ -90,8 +100,11 @@ def main():
                        env=env, check=True)
         base = application_url()
         ready(base)
+        sampler.start()
         runner = COMPOSE + ["--profile", "tools", "run", "--rm",
-                            "--user", f"{os.getuid()}:{os.getgid()}", "load", "--output", "/results",
+                            "--user", os.environ.get("LOCAL_UID", str(os.getuid())) + ":"
+                            + os.environ.get("LOCAL_GID", str(os.getgid())),
+                            "load", "--output", "/results",
                             "--mode", "ojp", "--scenario", args.scenario,
                             "--warmup", str(args.warmup), "--duration", str(args.duration),
                             "--run-id", args.run_id] + forwarded
@@ -122,6 +135,19 @@ def main():
             time.sleep(.2)
         else:
             raise RuntimeError("Never observed this run's measurement context")
+        nodes = []
+        state = subprocess.check_output(
+            COMPOSE + ["ps", "--format", "json", "ojp", "ojp2", "ojp3"], text=True)
+        for line in state.splitlines():
+            value = json.loads(line)
+            nodes.extend(value if isinstance(value, list) else [value])
+        report["ha_nodes_before_fault"] = [
+            {"service": node["Service"], "state": node["State"], "health": node.get("Health")}
+            for node in nodes
+        ]
+        if ({node["Service"] for node in nodes} != {"ojp", "ojp2", "ojp3"}
+                or any(node["State"] != "running" for node in nodes)):
+            raise RuntimeError("All three HA nodes must be running before fault injection")
         time.sleep(min(2, args.duration / 3))
         if process.poll() is not None:
             raise RuntimeError("Measurement ended before fault injection")
@@ -163,6 +189,8 @@ def main():
         report["success"] = False
         report["error"] = failure
     finally:
+        if sampler.thread.ident is not None:
+            sampler.stop()
         if process is not None and process.poll() is None:
             process.terminate()
             try:

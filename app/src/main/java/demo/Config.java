@@ -5,7 +5,8 @@ import java.util.Properties;
 
 record Config(String pgUrl, String pgUser, String pgPassword, String ojpUrl, String bind,
               int port, int adminPort, int poolSize, int workers, int queueSize,
-              int startupSeconds, int sqlTimeoutSeconds, boolean testEndpoints, String initialMode) {
+              int startupSeconds, int sqlTimeoutSeconds, boolean testEndpoints, String initialMode,
+              int ojpPoolSize, int ojpMinIdle) {
     static Config load(Map<String, String> env) {
         env = new java.util.HashMap<>(env);
         alias(env, "PG_URL", "DB_URL"); alias(env, "PG_USER", "DB_USER"); alias(env, "PG_PASSWORD", "DB_PASSWORD");
@@ -15,11 +16,15 @@ record Config(String pgUrl, String pgUser, String pgPassword, String ojpUrl, Str
         if (!pg.startsWith("jdbc:postgresql://") || !ojp.startsWith("jdbc:ojp[")) {
             throw new IllegalArgumentException("PG_URL must be PostgreSQL JDBC; OJP_URL must be OJP JDBC");
         }
+        ojp = applicationName(ojp, "demo-ojp");
         String mode = env.getOrDefault("MODE", "direct");
         if (!mode.equals("direct") && !mode.equals("ojp")) throw new IllegalArgumentException("MODE must be direct|ojp");
         int port = number(env, "PORT", 8080, 1, 65535);
         int admin = number(env, "ADMIN_PORT", 8081, 1, 65535);
         if (port == admin) throw new IllegalArgumentException("PORT and ADMIN_PORT must differ");
+        int ojpPoolSize = number(env, "OJP_POOL_SIZE", 40, 1, 2000);
+        int ojpMinIdle = number(env, "OJP_MIN_IDLE", 10, 0, 2000);
+        if (ojpMinIdle > ojpPoolSize) throw new IllegalArgumentException("OJP_MIN_IDLE must not exceed OJP_POOL_SIZE");
         return new Config(pg, env.getOrDefault("PG_USER", "demo"), env.getOrDefault("PG_PASSWORD", "demo"),
                 ojp, env.getOrDefault("BIND_ADDRESS", "0.0.0.0"), port, admin,
                 number(env, "DIRECT_POOL_SIZE", 200, 1, 2000),
@@ -27,7 +32,16 @@ record Config(String pgUrl, String pgUser, String pgPassword, String ojpUrl, Str
                 number(env, "HTTP_QUEUE_SIZE", 1024, 200, 10000),
                 number(env, "STARTUP_TIMEOUT_SECONDS", 180, 1, 1800),
                 number(env, "SQL_TIMEOUT_SECONDS", 30, 1, 600),
-                Boolean.parseBoolean(env.getOrDefault("TEST_ENDPOINTS", "false")), mode);
+                Boolean.parseBoolean(env.getOrDefault("TEST_ENDPOINTS", "false")), mode, ojpPoolSize, ojpMinIdle);
+    }
+
+    static String applicationName(String url, String name) {
+        int question = url.indexOf('?');
+        String base = question < 0 ? url : url.substring(0, question);
+        String query = question < 0 ? "" : java.util.Arrays.stream(url.substring(question + 1).split("&"))
+                .filter(p -> !p.split("=", 2)[0].equalsIgnoreCase("ApplicationName"))
+                .filter(p -> !p.isEmpty()).collect(java.util.stream.Collectors.joining("&"));
+        return base + "?" + (query.isEmpty() ? "" : query + "&") + "ApplicationName=" + name;
     }
 
     private static void alias(Map<String, String> env, String preferred, String fallback) {
@@ -44,8 +58,8 @@ record Config(String pgUrl, String pgUser, String pgPassword, String ojpUrl, Str
         Properties properties = new Properties();
         properties.setProperty("user", pgUser);
         properties.setProperty("password", pgPassword);
-        properties.setProperty("ojp.connection.pool.maximumPoolSize", "40");
-        properties.setProperty("ojp.connection.pool.minimumIdle", "10");
+        properties.setProperty("ojp.connection.pool.maximumPoolSize", Integer.toString(ojpPoolSize));
+        properties.setProperty("ojp.connection.pool.minimumIdle", Integer.toString(ojpMinIdle));
         properties.setProperty("ojp.connection.pool.connectionTimeout", "30000");
         properties.setProperty("ojp.jdbc.connection.close.synchronous", "true");
         return properties;

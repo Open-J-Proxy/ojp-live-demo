@@ -25,6 +25,7 @@ public final class Main implements AutoCloseable {
     private final ThreadPoolExecutor workers, adminWorkers;
     private final Semaphore admission, mutation = new Semaphore(1);
     private final AtomicInteger inflight = new AtomicInteger(), holdActive = new AtomicInteger(), holdPeak = new AtomicInteger();
+    private volatile String runId = "";
 
     Main(Config config) throws IOException {
         this.config = config;
@@ -70,7 +71,12 @@ public final class Main implements AutoCloseable {
             switch (path) {
                 case "/health" -> {
                     method(exchange, "GET");
-                    send(exchange, 200, Map.of("status", "up"));
+                    Metrics.Context context = metrics.context;
+                    Map<String, Object> metadata = Map.of("phase", context.phase(), "scenario", context.scenario(),
+                            "level", context.level(), "run_id", runId);
+                    send(exchange, 200, Map.of("status", "up", "mode", database.mode, "ready", database.ready,
+                            "phase", context.phase(), "scenario", context.scenario(), "level", context.level(),
+                            "run_id", runId, "context", metadata));
                 }
                 case "/ready" -> {
                     method(exchange, "GET");
@@ -83,6 +89,9 @@ public final class Main implements AutoCloseable {
                     gauges.put("http_workers", config.workers());
                     gauges.put("http_workers_active", workers.getActiveCount());
                     gauges.put("http_queue", workers.getQueue().size());
+                    gauges.put("admin_workers", 16);
+                    gauges.put("admin_workers_active", adminWorkers.getActiveCount());
+                    gauges.put("admin_queue", adminWorkers.getQueue().size());
                     gauges.put("inflight", inflight.get());
                     gauges.put("hold_active", holdActive.get());
                     gauges.put("hold_peak", holdPeak.get());
@@ -113,6 +122,37 @@ public final class Main implements AutoCloseable {
                         } finally { holdActive.decrementAndGet(); stats.request.record(System.nanoTime() - start); }
                     });
                 }
+                case "/resources" -> {
+                    method(exchange, "POST");
+                    if (!authorized(exchange)) { send(exchange, 401, Map.of("error", "Admin authorization required")); return; }
+                    metrics.resources(Double.parseDouble(query.getOrDefault("cpu_percent", "")),
+                            Double.parseDouble(query.getOrDefault("memory_percent", "")));
+                    send(exchange, 200, Map.of("ok", true));
+                }
+                case "/arrivals" -> {
+                    method(exchange, "POST");
+                    if (!authorized(exchange)) { send(exchange, 401, Map.of("error", "Admin authorization required")); return; }
+                    Metrics.Context context = context(query);
+                    Metrics.Arrivals update = new Metrics.Arrivals(
+                            count(query, "scheduled"), count(query, "dispatched"), count(query, "dropped"),
+                            count(query, "inflight"), count(query, "completed"), count(query, "errors"),
+                            count(query, "accepted"), count(query, "sql_completed"), count(query, "timeouts"), latency(query));
+                    for (String alias : List.of("successful_transactions", "failed_transactions", "http_completed")) {
+                        if (query.containsKey(alias)) {
+                            long expected = alias.equals("successful_transactions") ? update.completed()
+                                    : alias.equals("failed_transactions") ? update.errors() : update.completed() + update.errors();
+                            if (count(query, alias) != expected) throw new IllegalArgumentException("Inconsistent " + alias);
+                        }
+                    }
+                    if (Boolean.parseBoolean(query.getOrDefault("final", "false"))
+                            && (update.inflight() != 0 || update.scheduled() != update.dispatched() + update.dropped()
+                            || update.dispatched() != update.completed() + update.errors()))
+                        throw new IllegalArgumentException("Final arrivals must be fully drained and accounted for");
+                    metrics.arrivals(query.getOrDefault("mode", database.mode), context, update,
+                            Boolean.parseBoolean(query.getOrDefault("reset", "false")));
+                    send(exchange, 200, Map.of("ok", true, "scheduled", update.scheduled(), "dispatched", update.dispatched(),
+                            "dropped", update.dropped(), "inflight", update.inflight()));
+                }
                 case "/mode", "/reset", "/context", "/rollback" -> {
                     method(exchange, "POST");
                     if (!authorized(exchange)) { send(exchange, 401, Map.of("error", "Admin authorization required")); return; }
@@ -125,9 +165,13 @@ public final class Main implements AutoCloseable {
                             }
                             case "/reset" -> { database.reset(); send(exchange, 200, Map.of("ok", true)); }
                             case "/context" -> {
-                                metrics.context = context(query);
+                                String nextRunId = query.getOrDefault("run_id", "");
+                                if (nextRunId.length() > 64 || nextRunId.chars().anyMatch(c -> c < 32))
+                                    throw new IllegalArgumentException("run_id must be at most64 printable characters");
+                                metrics.updateContext(context(query), !Objects.equals(runId, nextRunId));
+                                runId = nextRunId;
                                 send(exchange, 200, Map.of("ok", true, "phase", metrics.context.phase(),
-                                        "scenario", metrics.context.scenario(), "level", metrics.context.level()));
+                                        "scenario", metrics.context.scenario(), "level", metrics.context.level(), "run_id", runId));
                             }
                             case "/rollback" -> {
                                 testEnabled();
@@ -167,7 +211,18 @@ public final class Main implements AutoCloseable {
     private Metrics.Context context(Map<String, String> query) {
         Metrics.Context c = metrics.context;
         return metrics.context(query.getOrDefault("phase", c.phase()), query.getOrDefault("scenario", c.scenario()),
-                Integer.parseInt(query.getOrDefault("level", Integer.toString(c.level()))));
+                Double.parseDouble(query.getOrDefault("level", Double.toString(c.level()))));
+    }
+    private static long count(Map<String, String> query, String key) {
+        return Long.parseLong(query.getOrDefault(key, "0"));
+    }
+    private static Metrics.Latency latency(Map<String, String> query) {
+        if (!query.containsKey("latency_bucket_counts") && !query.containsKey("latency_count")
+                && !query.containsKey("latency_sum_seconds")) return null;
+        List<Long> buckets = Arrays.stream(query.getOrDefault("latency_bucket_counts", "").split(",", -1))
+                .map(Long::parseLong).toList();
+        return new Metrics.Latency(count(query, "latency_count"),
+                Double.parseDouble(query.getOrDefault("latency_sum_seconds", "0")), buckets);
     }
 
     static Map<String, String> query(String raw) {
@@ -221,6 +276,7 @@ public final class Main implements AutoCloseable {
                         java -jar demo.jar [--help|--version|--validate-config]
                         Env: PG_URL PG_USER PG_PASSWORD PG_ADMIN_URL PG_ADMIN_USER PG_ADMIN_PASSWORD
                              OJP_URL MODE=direct|ojp DIRECT_POOL_SIZE=200 HTTP_WORKERS=512
+                             OJP_POOL_SIZE=40 OJP_MIN_IDLE=10
                              PORT=8080 ADMIN_PORT=8081 HTTP_QUEUE_SIZE=1024 STARTUP_TIMEOUT_SECONDS=180
                              SQL_TIMEOUT_SECONDS=30 BIND_ADDRESS=0.0.0.0 TEST_ENDPOINTS=false ADMIN_TOKEN
                         Admin mutations are demo-only: protect both ports; set ADMIN_TOKEN outside local demos.
@@ -229,7 +285,8 @@ public final class Main implements AutoCloseable {
                 case "--validate-config" -> {
                     Config c = Config.load(System.getenv());
                     System.out.println(Json.encode(Map.of("valid", true, "java", Runtime.version().feature(),
-                            "workers", c.workers(), "direct_pool_size", c.poolSize(), "ojp_pool_max", 40, "ojp_pool_min", 10)));
+                            "workers", c.workers(), "direct_pool_size", c.poolSize(),
+                            "ojp_pool_max", c.ojpPoolSize(), "ojp_pool_min", c.ojpMinIdle())));
                 }
                 case "--healthcheck" -> {
                     Config c = Config.load(System.getenv());

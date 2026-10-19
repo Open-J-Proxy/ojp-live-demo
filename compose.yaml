@@ -56,7 +56,7 @@ services:
     build:
       context: ./app
       args:
-        MAVEN_IMAGE: ${MAVEN_IMAGE:-maven:3.9.9-eclipse-temurin-21}
+        MAVEN_IMAGE: ${MAVEN_IMAGE:-maven:3.9.11-eclipse-temurin-21}
         JAVA_IMAGE: ${JAVA_IMAGE:-eclipse-temurin:21-jre}
       secrets:
         - maven_extra_ca
@@ -72,6 +72,7 @@ services:
       HTTP_QUEUE_SIZE: ${HTTP_QUEUE_SIZE:-1024}
       STARTUP_TIMEOUT_SECONDS: ${STARTUP_TIMEOUT_SECONDS:-180}
       TEST_ENDPOINTS: ${TEST_ENDPOINTS:-false}
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-}
     ports:
       - "127.0.0.1:${APP_PORT:-8080}:8080"
     depends_on:
@@ -95,6 +96,7 @@ services:
     user: "${LOCAL_UID:-1001}:${LOCAL_GID:-1001}"
     environment:
       RESULTS_DIR: /results
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-}
     profiles: ["tools"]
     volumes:
       - ${RESULTS_DIR:-./results}:/results
@@ -105,7 +107,7 @@ services:
     cpus: 1.0
 
   postgres-exporter:
-    image: ${POSTGRES_EXPORTER_IMAGE:-quay.io/prometheuscommunity/postgres-exporter:v0.17.1}
+    image: ${POSTGRES_EXPORTER_IMAGE:-quay.io/prometheuscommunity/postgres-exporter:v0.20.1}
     environment:
       DATA_SOURCE_NAME: postgresql://demo:${DB_PASSWORD:-demo-local-only}@postgres:5432/shop?sslmode=disable
     depends_on:
@@ -119,7 +121,7 @@ services:
     mem_limit: 128m
 
   prometheus:
-    image: ${PROMETHEUS_IMAGE:-prom/prometheus:v3.2.1}
+    image: ${PROMETHEUS_IMAGE:-prom/prometheus:v3.15.0}
     command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.retention.time=7d"]
     volumes:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
@@ -134,7 +136,7 @@ services:
     mem_limit: 512m
 
   grafana:
-    image: ${GRAFANA_IMAGE:-grafana/grafana:11.6.0}
+    image: ${GRAFANA_IMAGE:-grafana/grafana:13.2.4}
     environment:
       GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-demo-local-only}

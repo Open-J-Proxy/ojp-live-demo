@@ -12,9 +12,11 @@ Without a flag, restores the seeded application baseline through POST /reset.
     ;;
   '')
     python3 - "$(application_url)" <<'PY'
-import sys, urllib.request
-request = urllib.request.Request(sys.argv[1] + "/reset", data=b"", method="POST")
-with urllib.request.urlopen(request, timeout=120) as response:
+import os, sys, urllib.request
+request = urllib.request.Request(sys.argv[1] + "/reset", method="POST")
+if os.environ.get("ADMIN_TOKEN"):
+    request.add_header("Authorization", "Bearer " + os.environ["ADMIN_TOKEN"])
+with urllib.request.urlopen(request, timeout=180) as response:
     print(response.read().decode())
 PY
     ;;

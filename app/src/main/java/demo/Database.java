@@ -10,15 +10,17 @@ import java.util.concurrent.*;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 final class Database implements AutoCloseable {
+    private static final org.postgresql.Driver POSTGRES_DRIVER = new org.postgresql.Driver();
     private final Config config;
     private final Metrics metrics;
     private final ReentrantReadWriteLock gate = new ReentrantReadWriteLock(true);
     private volatile HikariDataSource direct;
     volatile String mode = "starting", state = "starting", diagnostic = "Initializing database";
     volatile boolean ready;
-    private long orderBaseline, reviewBaseline, itemBaseline;
     private long[] users, products;
     private volatile int directSessions = -1;
+    private volatile String lastError = "";
+    private volatile int postgresMaxConnections = -1, postgresSessions = -1, postgresActiveSessions = -1;
 
     Database(Config config, Metrics metrics) { this.config = config; this.metrics = metrics; }
 
@@ -29,16 +31,17 @@ final class Database implements AutoCloseable {
             long deadline = deadline();
             while (true) {
                 try (Connection c = admin()) {
+                    refreshPostgresDiagnostics(c);
                     users = ids(c, "SELECT id FROM users ORDER BY id");
                     products = ids(c, "SELECT id FROM products ORDER BY id");
-                    try (PreparedStatement p = statement(c, "SELECT orders,items,reviews FROM benchmark_seed");
+                    try (PreparedStatement p = statement(c, "SELECT seed FROM benchmark_seed WHERE singleton");
                          ResultSet r = p.executeQuery()) {
                         if (!r.next()) throw new SQLException("Seed baseline missing");
-                        orderBaseline = r.getLong(1); itemBaseline = r.getLong(2); reviewBaseline = r.getLong(3);
                     }
                     if (users.length == 0 || products.length == 0) throw new SQLException("Seed users/products missing");
                     break;
                 } catch (SQLException e) {
+                    lastError = describe(e);
                     diagnostic = "Waiting for seeded PostgreSQL schema (" + e.getSQLState() + ")";
                     if (System.nanoTime() >= deadline) throw e;
                     Thread.sleep(500);
@@ -50,8 +53,10 @@ final class Database implements AutoCloseable {
 
     private void fail(Exception e) {
         ready = false; state = "failed";
-        diagnostic += ": " + (e instanceof SQLException sql
-                ? "Database error SQLState=" + sql.getSQLState() : e.getClass().getSimpleName());
+        String failure = describe(e);
+        diagnostic += ": " + failure;
+        if (lastError.isEmpty() || !(e instanceof TimeoutException)) lastError = failure;
+        try (Connection c = admin()) { refreshPostgresDiagnostics(c); } catch (SQLException ignored) {}
         System.err.println("Database initialization/switch failed: " + diagnostic);
     }
 
@@ -63,7 +68,7 @@ final class Database implements AutoCloseable {
         p.setProperty("ApplicationName", "demo-admin");
         p.setProperty("connectTimeout", "5");
         p.setProperty("socketTimeout", "10");
-        return DriverManager.getConnection(env.getOrDefault("PG_ADMIN_URL", config.pgUrl()), p);
+        return POSTGRES_DRIVER.connect(Config.applicationName(env.getOrDefault("PG_ADMIN_URL", config.pgUrl()), "demo-admin"), p);
     }
 
     synchronized void switchMode(String next) throws Exception {
@@ -87,6 +92,7 @@ final class Database implements AutoCloseable {
                 Thread.sleep(100);
             }
             mode = next;
+            metrics.mode = next;
             if (next.equals("direct")) {
                 diagnostic = "Proactively filling direct pool";
                 direct = pool();
@@ -122,7 +128,9 @@ final class Database implements AutoCloseable {
 
     private HikariDataSource pool() {
         HikariConfig h = new HikariConfig();
-        h.setJdbcUrl(config.pgUrl()); h.setUsername(config.pgUser()); h.setPassword(config.pgPassword());
+        h.setDriverClassName("org.postgresql.Driver");
+        h.setJdbcUrl(Config.applicationName(config.pgUrl(), "demo-direct"));
+        h.setUsername(config.pgUser()); h.setPassword(config.pgPassword());
         h.setPoolName("demo-direct");
         h.setMaximumPoolSize(config.poolSize()); h.setMinimumIdle(config.poolSize());
         h.setInitializationFailTimeout(-1); h.setConnectionTimeout(Math.min(30000L, config.startupSeconds() * 1000L));
@@ -143,7 +151,7 @@ final class Database implements AutoCloseable {
                 try (Connection ignored = pool.getConnection()) {
                     acquired.countDown();
                     release.await();
-                } catch (SQLException e) { throw new CompletionException(e); }
+                } catch (SQLException e) { lastError = describe(e); throw new CompletionException(e); }
                 catch (InterruptedException e) { Thread.currentThread().interrupt(); }
             }));
             if (!acquired.await(Math.max(1, deadline - System.nanoTime()), TimeUnit.NANOSECONDS))
@@ -157,6 +165,7 @@ final class Database implements AutoCloseable {
 
     private int sessionCount() throws SQLException {
         try (Connection c = admin()) {
+            refreshPostgresDiagnostics(c);
             directSessions = Math.toIntExact(scalar(c,
                     "SELECT count(*) FROM pg_stat_activity WHERE application_name='demo-direct' AND datname=current_database()"));
             return directSessions;
@@ -167,6 +176,7 @@ final class Database implements AutoCloseable {
         boolean dbOk = false;
         if (probe) {
             try (Connection c = admin()) {
+                refreshPostgresDiagnostics(c);
                 dbOk = scalar(c, "SELECT 1") == 1;
                 directSessions = Math.toIntExact(scalar(c,
                         "SELECT count(*) FROM pg_stat_activity WHERE application_name='demo-direct' AND datname=current_database()"));
@@ -177,9 +187,36 @@ final class Database implements AutoCloseable {
         result.put("state", state); result.put("diagnostic", diagnostic);
         result.put("database", dbOk); result.put("direct_sessions", directSessions);
         result.put("direct_pool_target", config.poolSize());
-        result.put("ojp_pool_max", 40); result.put("ojp_pool_min", 10);
+        result.put("ojp_pool_max", config.ojpPoolSize()); result.put("ojp_pool_min", config.ojpMinIdle());
         result.put("logical_open", metrics.opened.sum() - metrics.closed.sum());
+        result.put("last_error", lastError);
+        result.put("postgres_max_connections", postgresMaxConnections);
+        result.put("postgres_sessions", postgresSessions);
+        result.put("postgres_active_sessions", postgresActiveSessions);
         return result;
+    }
+
+    private void refreshPostgresDiagnostics(Connection c) throws SQLException {
+        try (PreparedStatement p = statement(c, "SELECT current_setting('max_connections')::int,"
+                + "count(*) FILTER (WHERE backend_type='client backend'),"
+                + "count(*) FILTER (WHERE backend_type='client backend' AND state='active') FROM pg_stat_activity");
+             ResultSet r = p.executeQuery()) {
+            r.next(); postgresMaxConnections = r.getInt(1); postgresSessions = r.getInt(2); postgresActiveSessions = r.getInt(3);
+        }
+    }
+
+    private String describe(Throwable error) {
+        StringBuilder text = new StringBuilder();
+        for (int i = 0; error != null && i < 5; i++, error = error.getCause()) {
+            if (!text.isEmpty()) text.append(" <- ");
+            text.append(error.getClass().getSimpleName());
+            if (error instanceof SQLException sql) text.append(" SQLState=").append(sql.getSQLState());
+            if (error.getMessage() != null) text.append(": ").append(error.getMessage());
+        }
+        String value = text.toString();
+        for (String secret : new String[]{config.pgPassword(), System.getenv().getOrDefault("PG_ADMIN_PASSWORD", "")})
+            if (!secret.isEmpty()) value = value.replace(secret, "[redacted]");
+        return value.substring(0, Math.min(2000, value.length()));
     }
 
     Map<String, Number> gauges() {
@@ -208,24 +245,27 @@ final class Database implements AutoCloseable {
                         : DriverManager.getConnection(config.ojpUrl(), config.ojpProperties());
                 metrics.opened.increment();
             } finally { stats.acquisition.record(System.nanoTime() - acquireStart); }
-            long rows;
+            long rows = 0;
             try (AutoCloseable resource = () -> { c.close(); metrics.closed.increment(); }) {
                 long sqlStart = System.nanoTime();
                 try {
                     c.setAutoCommit(false);
                     rows = execute(c, op, seed);
-                    if (forceRollback) {
-                        c.rollback(); stats.rollbacks.increment();
-                    } else c.commit();
+                    if (forceRollback) throw new ForcedRollback();
+                    c.commit();
                 } catch (Exception e) {
                     try { c.rollback(); stats.rollbacks.increment(); } catch (SQLException rollback) { e.addSuppressed(rollback); }
-                    throw e;
+                    if (forceRollback && e instanceof ForcedRollback && e.getSuppressed().length == 0) stats.errors.increment();
+                    else throw e;
                 } finally { stats.sql.record(System.nanoTime() - sqlStart); }
             }
-            stats.completed.increment();
-            return Map.of("ok", true, "mode", transactionMode, "op", op, "rows", rows,
-                    "rolledBack", forceRollback, "rollback", forceRollback, "completed", stats.completed.sum(),
-                    "errors", stats.errors.sum(), "rollbacks", stats.rollbacks.sum());
+            if (!forceRollback) stats.completed.increment();
+            Map<String, Object> result = new LinkedHashMap<>(Map.of("ok", true, "success", true,
+                    "mode", transactionMode, "op", op, "rows", rows, "sql_completed", true,
+                    "rollback", forceRollback, "completed", stats.completed.sum(),
+                    "errors", stats.errors.sum(), "rollbacks", stats.rollbacks.sum()));
+            result.put("rolledBack", forceRollback);
+            return result;
         } catch (Exception e) {
             stats.errors.increment(); throw e;
         } finally {
@@ -241,50 +281,65 @@ final class Database implements AutoCloseable {
             case "browse" -> query(c, "SELECT id,name,price FROM products WHERE id>=? ORDER BY id LIMIT 20", product);
             case "history" -> query(c, "SELECT o.id,o.order_date,i.product_id,i.quantity,p.price FROM orders o JOIN order_items i ON i.order_id=o.id JOIN products p ON p.id=i.product_id WHERE o.user_id=? ORDER BY o.id DESC LIMIT 50", user);
             case "account" -> query(c, "SELECT u.id,u.username,u.email,count(o.id) AS order_count FROM users u LEFT JOIN orders o ON o.user_id=u.id WHERE u.id=? GROUP BY u.id,u.username,u.email", user);
-            case "report" -> query(c, "SELECT p.id,p.name,count(r.id),coalesce(avg(r.rating),0) FROM products p LEFT JOIN reviews r ON r.product_id=p.id WHERE p.id BETWEEN ? AND ? GROUP BY p.id,p.name ORDER BY count(r.id) DESC LIMIT 25", product, product + 100);
-            case "checkout", "rollback" -> checkout(c, user, product);
+            case "report" -> report(c, Math.floorMod(seed, 4));
+            case "checkout", "rollback" -> checkout(c, user, random);
             case "review" -> update(c, "INSERT INTO reviews(user_id,product_id,rating,comment) VALUES(?,?,?,?)",
                     user, product, random.nextInt(1, 6), "Demo review");
             default -> throw new IllegalArgumentException("Unsupported operation");
         };
     }
 
-    private long checkout(Connection c, long user, long product) throws SQLException {
-        try (PreparedStatement p = statement(c, "SELECT price FROM products WHERE id=?")) {
-            p.setLong(1, product);
-            try (ResultSet r = p.executeQuery()) {
-                if (!r.next()) throw new SQLException("Product missing");
-                r.getBigDecimal(1);
-            }
-        }
+    private long report(Connection c, int variant) throws SQLException {
+        Timestamp from = Timestamp.valueOf("2024-01-01 00:00:00"), until = Timestamp.valueOf("2026-01-01 00:00:00");
+        return switch (variant) {
+            case 0 -> query(c, "SELECT date_trunc('day',o.order_date) AS day,count(DISTINCT o.id),sum(i.quantity),sum(i.quantity*p.price) AS revenue FROM orders o JOIN order_items i ON i.order_id=o.id JOIN products p ON p.id=i.product_id WHERE o.order_date>=? AND o.order_date<? GROUP BY day ORDER BY day", from, until);
+            case 1 -> query(c, "SELECT p.id,p.name,sum(i.quantity) AS units,sum(i.quantity*p.price) AS revenue FROM order_items i JOIN products p ON p.id=i.product_id JOIN orders o ON o.id=i.order_id WHERE o.order_date>=? AND o.order_date<? GROUP BY p.id,p.name ORDER BY revenue DESC,p.id LIMIT 50", from, until);
+            case 2 -> query(c, "SELECT u.id,u.username,count(DISTINCT o.id),sum(i.quantity),sum(i.quantity*p.price) AS spent FROM users u JOIN orders o ON o.user_id=u.id JOIN order_items i ON i.order_id=o.id JOIN products p ON p.id=i.product_id WHERE o.order_date>=? AND o.order_date<? GROUP BY u.id,u.username ORDER BY spent DESC,u.id LIMIT 50", from, until);
+            default -> query(c, "SELECT p.id,p.name,count(r.id) AS reviews,avg(r.rating) AS rating FROM products p JOIN reviews r ON r.product_id=p.id WHERE r.id<=(SELECT reviews FROM benchmark_seed WHERE singleton) GROUP BY p.id,p.name ORDER BY reviews DESC,p.id LIMIT 50");
+        };
+    }
+
+    private long checkout(Connection c, long user, SplittableRandom random) throws SQLException {
+        int itemCount = random.nextInt(1, 6);
         long order;
         try (PreparedStatement p = statement(c,
                 "INSERT INTO orders(user_id,order_date) VALUES(?,CURRENT_TIMESTAMP) RETURNING id")) {
             p.setLong(1, user);
             try (ResultSet r = p.executeQuery()) { r.next(); order = r.getLong(1); }
         }
-        return update(c, "INSERT INTO order_items(order_id,product_id,quantity) VALUES(?,?,1)", order, product);
+        try (PreparedStatement product = statement(c, "SELECT price FROM products WHERE id=?");
+             PreparedStatement item = statement(c, "INSERT INTO order_items(order_id,product_id,quantity) VALUES(?,?,?)")) {
+            for (int i = 0; i < itemCount; i++) {
+                long productId = products[random.nextInt(products.length)];
+                int quantity = random.nextInt(1, 6);
+                product.setLong(1, productId);
+                try (ResultSet r = product.executeQuery()) {
+                    if (!r.next()) throw new SQLException("Product missing");
+                    r.getBigDecimal(1);
+                }
+                item.setLong(1, order); item.setLong(2, productId); item.setInt(3, quantity); item.executeUpdate();
+            }
+        }
+        return itemCount;
     }
 
     synchronized void reset() throws Exception {
         if (!ready) throw new IllegalStateException("Service not ready");
-        if (!gate.writeLock().tryLock(config.startupSeconds(), TimeUnit.SECONDS)) throw new TimeoutException("Reset drain timeout");
+        ready = false; state = "resetting"; diagnostic = "Draining transactions for baseline reset";
+        if (!gate.writeLock().tryLock(config.startupSeconds(), TimeUnit.SECONDS)) {
+            TimeoutException e = new TimeoutException("Reset drain timeout");
+            fail(e); throw e;
+        }
         try (Connection c = admin()) {
             c.setAutoCommit(false);
             try {
-                update(c, "DELETE FROM order_items WHERE order_id>?", orderBaseline);
-                update(c, "DELETE FROM orders WHERE id>?", orderBaseline);
-                update(c, "DELETE FROM reviews WHERE id>?", reviewBaseline);
-                resetSequence(c, "orders", orderBaseline);
-                resetSequence(c, "order_items", itemBaseline);
-                resetSequence(c, "reviews", reviewBaseline);
+                query(c, "SELECT benchmark_reset()");
                 c.commit();
             } catch (Exception e) { c.rollback(); throw e; }
+            ready = true; state = "ready"; diagnostic = "Ready";
+        } catch (Exception e) {
+            fail(e); throw e;
         } finally { gate.writeLock().unlock(); }
-    }
-
-    private void resetSequence(Connection c, String table, long baseline) throws SQLException {
-        query(c, "SELECT setval(pg_get_serial_sequence(?, 'id'), ?, ?)", table, Math.max(1, baseline), baseline > 0);
     }
 
     private long[] ids(Connection c, String sql) throws SQLException {
@@ -320,6 +375,9 @@ final class Database implements AutoCloseable {
     }
     private static void bind(PreparedStatement p, Object[] args) throws SQLException {
         for (int i = 0; i < args.length; i++) p.setObject(i + 1, args[i]);
+    }
+    private static final class ForcedRollback extends SQLException {
+        ForcedRollback() { super("Deliberate test-only failure after checkout inserts", "ZT001"); }
     }
     private long deadline() { return System.nanoTime() + Duration.ofSeconds(config.startupSeconds()).toNanos(); }
     private static void checkDeadline(long deadline) throws TimeoutException {

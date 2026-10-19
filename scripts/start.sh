@@ -15,6 +15,7 @@ Existing data is preserved. SEED_* variables control first-start fixture sizes.'
   shift
 done
 preflight
+mkdir -p "$RESULTS_DIR"
 compose up -d --wait --wait-timeout "${START_TIMEOUT:-180}" postgres
 if "$seed"; then "$SCRIPT_DIR/seed-data.sh"; fi
 args=(up -d)

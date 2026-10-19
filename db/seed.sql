@@ -12,7 +12,7 @@ FROM benchmark_seed \gset
 \endif
 \else
 BEGIN;
-SELECT setseed(((:seed::bigint % 2000000)::double precision / 1000000) - 1);
+SELECT setseed((((:seed::bigint % 2000000 + 2000000) % 2000000)::double precision / 1000000) - 1);
 INSERT INTO users (id, username, email, created_at)
 SELECT g, 'customer-' || g, 'customer-' || g || '@example.invalid',
        timestamp '2023-01-01' + (random() * 365 * interval '1 day')
@@ -51,15 +51,15 @@ SELECT setval(pg_get_serial_sequence('reviews', 'id'), :reviews, true);
 INSERT INTO benchmark_seed VALUES (true, :seed, :users, :products, :orders, :items, :reviews);
 COMMIT;
 \endif
-SELECT (SELECT count(*) FROM users) = :users
-   AND (SELECT count(*) FROM products) = :products
-   AND (SELECT count(*) FROM orders) = :orders
-   AND (SELECT count(*) FROM order_items) = :items
-   AND (SELECT count(*) FROM reviews) = :reviews AS valid \gset
+SELECT (SELECT count(*) FROM users WHERE id <= :users) = :users
+   AND (SELECT count(*) FROM products WHERE id <= :products) = :products
+   AND (SELECT count(*) FROM orders WHERE id <= :orders) = :orders
+   AND (SELECT count(*) FROM order_items WHERE id <= :items) = :items
+   AND (SELECT count(*) FROM reviews WHERE id <= :reviews) = :reviews AS valid \gset
 \if :valid
-\echo 'All five row counts verified.'
+\echo 'All five baseline row counts verified; appended benchmark writes are retained until reset.'
 \else
-\echo 'Unexpected row counts: database may contain benchmark writes. Reset benchmark state first.'
+\echo 'Baseline row counts differ from the seed manifest. Explicit regeneration is required.'
 \quit 1
 \endif
 ANALYZE;

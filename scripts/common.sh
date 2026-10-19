@@ -6,6 +6,8 @@ ROOT_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 export RESULTS_DIR="${RESULTS_DIR:-$ROOT_DIR/results}"
 [[ "$RESULTS_DIR" = /* ]] || RESULTS_DIR="$ROOT_DIR/$RESULTS_DIR"
 export RESULTS_DIR
+export LOCAL_UID="${LOCAL_UID:-$(id -u)}"
+export LOCAL_GID="${LOCAL_GID:-$(id -g)}"
 
 compose() { docker compose --project-directory "$ROOT_DIR" -f "$ROOT_DIR/compose.yaml" "$@"; }
 application_url() {
@@ -39,14 +41,14 @@ EOF
 }
 wait_app() {
   python3 - "$(application_url)" "${START_TIMEOUT:-180}" <<'PY'
-import sys, time, urllib.request
+import json, sys, time, urllib.request
 url, timeout = sys.argv[1], float(sys.argv[2])
 deadline = time.monotonic() + timeout
 last = ""
 while time.monotonic() < deadline:
     try:
         with urllib.request.urlopen(url + "/ready", timeout=5) as response:
-            if response.status == 200:
+            if response.status == 200 and json.load(response).get("ready") is True:
                 break
     except Exception as error:
         last = str(error)
@@ -59,6 +61,5 @@ run_load() {
   local scenario="$1"; shift
   preflight
   mkdir -p "$RESULTS_DIR"
-  compose --profile tools run --rm --user "$(id -u):$(id -g)" load \
-    --output /results --scenario "$scenario" "$@"
+  python3 "$SCRIPT_DIR/resources.py" "$scenario" "$@"
 }

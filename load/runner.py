@@ -18,6 +18,7 @@ from pathlib import Path
 import random
 import re
 import socket
+import sys
 import threading
 import time
 import urllib.error
@@ -71,6 +72,25 @@ def rates(value):
     return result
 
 
+def operation_mix(value):
+    weights = {}
+    try:
+        for entry in value.split(","):
+            name, weight = (part.strip() for part in entry.split("="))
+            if name not in OPERATIONS or name in weights:
+                raise ValueError("unknown or duplicate operation")
+            number = int(weight)
+            if number < 0:
+                raise ValueError("negative operation weight")
+            weights[name] = number
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "expected each known operation exactly once with nonnegative integer weights") from exc
+    if set(weights) != set(OPERATIONS) or sum(weights.values()) != 100:
+        raise argparse.ArgumentTypeError("all six operation weights are required and must total 100")
+    return weights
+
+
 def parser():
     result = argparse.ArgumentParser(
         description=__doc__,
@@ -85,6 +105,8 @@ def parser():
                              "(default: 8,16,32,64,128,256)")
     result.add_argument("--warmup", type=nonnegative_float, default=30,
                         help="warmup arrival seconds; fully drained (default: 30)")
+    result.add_argument("--warmup-only", action="store_true",
+                        help="reset, check readiness, warm up and drain; never measure")
     result.add_argument("--duration", type=positive_float, default=60,
                         help="measurement arrival seconds, excluding drain (default: 60)")
     result.add_argument("--max-in-flight", type=positive_int, default=512,
@@ -103,6 +125,10 @@ def parser():
                         help="integer OLTP share; rescales 30:25:20:10:5 (default: 90)")
     result.add_argument("--olap-percent", type=percentage, default=10,
                         help="integer report share; total shares must be 100 (default: 10)")
+    result.add_argument("--operation-mix", type=operation_mix,
+                        help="optional exact integer percentages, all six keys required: "
+                             "browse=30,history=25,checkout=20,review=10,account=5,report=10; "
+                             "report must match --olap-percent and others --oltp-percent; zeros allowed")
     result.add_argument("--output", type=Path,
                         default=Path(os.environ.get(
                             "RESULTS_DIR", "/results" if Path("/results").is_dir() else "results")),
@@ -116,6 +142,11 @@ def arguments(argv=None):
     args = cli.parse_args(argv)
     if args.oltp_percent + args.olap_percent != 100:
         cli.error("--oltp-percent and --olap-percent must total 100")
+    if args.operation_mix is not None and (
+            args.operation_mix["report"] != args.olap_percent or
+            sum(weight for op, weight in args.operation_mix.items() if op != "report") !=
+            args.oltp_percent):
+        cli.error("--operation-mix report/other weights must match --olap-percent/--oltp-percent")
     parsed = urllib.parse.urlsplit(args.url)
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
         cli.error("--url must be an absolute http(s) URL")
@@ -234,7 +265,9 @@ def readiness(args, level):
                 if not is_ready(status, data):
                     break
             else:
-                probe = work(args, "browse" if args.oltp_percent else "report",
+                weights = args.operation_mix or operation_weights(
+                    args.oltp_percent, args.olap_percent)
+                probe = work(args, next(op for op, weight in weights.items() if weight),
                              args.seed, "warmup", level)
                 last["work_probe"] = probe
                 if probe["successful_transactions"]:
@@ -261,10 +294,13 @@ def utc_timestamp(epoch_seconds):
         timespec="milliseconds").replace("+00:00", "Z")
 
 
-def run_phase(args, rps, duration, phase, level, seed):
+def run_phase(args, rps, duration, phase, level, seed, mode=None):
+    mode = mode or ("direct" if args.mode == "both" else args.mode)
     counts = Counter({name: 0 for name in (
         "scheduled", "dispatched", "accepted", "sql_completed", "successful_transactions",
-        "failed_transactions", "timeouts", "dropped", "in_flight", "peak_in_flight", "completed")})
+        "failed_transactions", "timeouts", "dropped", "in_flight", "peak_in_flight", "completed",
+        "arrival_window_completed", "arrival_window_sql_completed",
+        "arrival_window_successful_transactions")})
     per_op = {op: Counter(scheduled=0, completed=0, dispatched=0, dropped=0,
                           sql_completed=0, successful_transactions=0) for op in OPERATIONS}
     samples = {op: {"end_to_end": array("d"), "service": array("d")} for op in OPERATIONS}
@@ -276,7 +312,8 @@ def run_phase(args, rps, duration, phase, level, seed):
     telemetry = {"samples_sent": 0, "errors": Counter(), "final_sent": False}
     stop_telemetry = threading.Event()
     rng = random.Random(seed)
-    schedule = operations(seed, operation_weights(args.oltp_percent, args.olap_percent))
+    weights = args.operation_mix or operation_weights(args.oltp_percent, args.olap_percent)
+    schedule = operations(seed, weights)
     # Decimal CLI values avoid phantom arrivals from binary float multiplication.
     target_fraction = Fraction(str(rps)) * Fraction(str(duration))
     target = math.ceil(target_fraction)
@@ -290,6 +327,10 @@ def run_phase(args, rps, duration, phase, level, seed):
                 "successful_transactions", "failed_transactions", "timeouts", "completed")}
             cumulative = list(itertools.accumulate(histogram))
             payload.update({"inflight": counts["in_flight"], "phase": phase, "level": level,
+                            "mode": mode, "errors": counts["failed_transactions"],
+                            "completed": counts["successful_transactions"],
+                            "http_completed": counts["completed"],
+                            "reset": str(telemetry["samples_sent"] == 0).lower(),
                             "scenario": args.scenario, "run_id": args.run_id,
                             "elapsed_seconds": time.monotonic() - start,
                             "final": str(final).lower(), "latency_count": counts["completed"],
@@ -301,6 +342,10 @@ def run_phase(args, rps, duration, phase, level, seed):
             telemetry["final_sent"] = final
         except Exception as exc:
             telemetry["errors"][type(exc).__name__] += 1
+            if final:
+                print(f"WARNING: final /arrivals publication failed for phase={phase} "
+                      f"level={level} ({type(exc).__name__}); metrics may be stale",
+                      file=sys.stderr, flush=True)
 
     def publish_periodically():
         while not stop_telemetry.wait(1):
@@ -314,6 +359,11 @@ def run_phase(args, rps, duration, phase, level, seed):
                 counts[key] += int(result[key])
             counts["failed_transactions"] += int(not result["successful_transactions"])
             counts["completed"] += 1
+            if result["completed"] <= start + duration:
+                counts["arrival_window_completed"] += 1
+                counts["arrival_window_sql_completed"] += int(result["sql_completed"])
+                counts["arrival_window_successful_transactions"] += int(
+                    result["successful_transactions"])
             counts["in_flight"] -= 1
             per_op[op]["completed"] += 1
             per_op[op]["sql_completed"] += int(result["sql_completed"])
@@ -328,6 +378,11 @@ def run_phase(args, rps, duration, phase, level, seed):
             pending.remove(future)
             condition.notify_all()
 
+    # Clear reused metric labels before any arrivals, without charging control latency
+    # to the open-loop schedule.
+    publish()
+    wall_start = time.time()
+    start = time.monotonic()
     telemetry_thread = threading.Thread(target=publish_periodically, name="load-telemetry", daemon=True)
     telemetry_thread.start()
     try:
@@ -383,6 +438,19 @@ def run_phase(args, rps, duration, phase, level, seed):
             "drain_seconds": max(0, finished - arrival_end),
             "in_flight_at_arrival_end": in_flight_at_end,
             "counts": dict(counts), "operations": per_op, "errors": dict(errors),
+            "throughput": {
+                "offered_per_second": counts["scheduled"] / duration if duration else 0,
+                "successful_completions_per_second": counts["successful_transactions"] /
+                                                    (finished - start),
+                "sql_completions_per_second": counts["sql_completed"] / (finished - start),
+                "completion_elapsed_seconds": finished - start,
+                "arrival_window_successful_completions_per_second":
+                    counts["arrival_window_successful_transactions"] / duration if duration else 0,
+                "arrival_window_sql_completions_per_second":
+                    counts["arrival_window_sql_completed"] / duration if duration else 0},
+            "error_fraction": (counts["failed_transactions"] / counts["dispatched"]
+                               if counts["dispatched"] else 0),
+            "drop_fraction": counts["dropped"] / counts["scheduled"] if counts["scheduled"] else 0,
             "telemetry": telemetry,
             "scheduled_latency_histogram": {
                 "buckets": dict(zip([*map(str, LATENCY_BUCKETS), "+Inf"],
@@ -402,6 +470,7 @@ def snapshot(args, path):
 def run_step(args, mode, rps, index):
     level = format(rps, ".12g")
     result = {"run_id": args.run_id, "scenario": args.scenario, "mode": mode, "level": level,
+              "warmup_only": args.warmup_only,
               "rps": rps, "seed": args.seed, "request_timeout": args.request_timeout,
               "max_in_flight": args.max_in_flight,
               "counter_semantics": {
@@ -410,7 +479,12 @@ def run_step(args, mode, rps, index):
                   "failed_transactions": "Dispatched attempts without a successful transaction, "
                                          "including rejection, timeout, SQL failure and rollback",
                   "completed": "Finished HTTP attempts, including failures and timeouts"},
-              "operation_weights": operation_weights(args.oltp_percent, args.olap_percent)}
+              "telemetry_counter_semantics": {
+                  "completed": "Successful transactions, as required by /arrivals",
+                  "http_completed": "Finished HTTP attempts, matching phase counts.completed",
+                  "sql_completed": "Synchronous SQL completions, including deliberate rollback"},
+              "operation_weights": args.operation_mix or operation_weights(
+                  args.oltp_percent, args.olap_percent)}
     try:
         result["mode_response"] = control(args, "/mode", {"value": mode})
         result["warmup_reset_response"] = control(args, "/reset")
@@ -421,14 +495,22 @@ def run_step(args, mode, rps, index):
         # Remove effects of the real-work readiness probe.
         control(args, "/reset")
         control(args, "/context", context)
-        result["warmup"] = run_phase(args, rps, args.warmup, "warmup", level, args.seed + index)
+        result["warmup"] = run_phase(args, rps, args.warmup, "warmup", level,
+                                     args.seed + index, mode=mode)
+        if args.warmup_only:
+            if args.warmup > 0 and result["warmup"]["counts"]["sql_completed"] == 0:
+                result["error"] = "warmup-only interval completed zero SQL operations"
+            return result
         result["measurement_reset_response"] = control(args, "/reset")
         result["readiness_before_measure"] = readiness(args, level)
         control(args, "/reset")
         context["phase"] = "measure"
         control(args, "/context", context)
         result["metrics_before_measure"] = snapshot(args, "/metrics")
-        result["measure"] = run_phase(args, rps, args.duration, "measure", level, args.seed + index)
+        result["measure"] = run_phase(args, rps, args.duration, "measure", level,
+                                      args.seed + index, mode=mode)
+        if result["measure"]["counts"]["sql_completed"] == 0:
+            result["error"] = "measurement interval completed zero SQL operations"
     except (OSError, urllib.error.URLError, ValueError, RuntimeError) as exc:
         result["error"] = str(exc)
     finally:
@@ -462,6 +544,10 @@ def export(args, result, step):
                        result.get("readiness_before_measure"), sort_keys=True),
                    "readiness_after_json": json.dumps(result.get("readiness_after"), sort_keys=True),
                    **{key: value for key, value in values.items() if key != "latency_ms"}}
+            if op == "all":
+                row.update(report["throughput"])
+                row.update(error_fraction=report["error_fraction"],
+                           drop_fraction=report["drop_fraction"])
             latency = report["latency_ms"] if op == "all" else values["latency_ms"]
             for kind, quantiles in latency.items():
                 row.update({f"{kind}_{key}_ms": value for key, value in quantiles.items()})
@@ -479,6 +565,12 @@ def export(args, result, step):
 
 def main(argv=None):
     args = arguments(argv)
+    safe_id = re.sub(r"[^a-zA-Z0-9_.-]", "_", args.run_id)
+    if any(path.is_file() for extension in ("json", "csv")
+           for path in args.output.glob(f"{safe_id}-*.{extension}")):
+        print(f"ERROR: results already exist for run ID {args.run_id!r} in {args.output}; "
+              "choose a unique --run-id", file=sys.stderr)
+        return 2
     modes = ("direct", "ojp") if args.mode == "both" else (args.mode,)
     step = 0
     for mode in modes:
@@ -486,8 +578,9 @@ def main(argv=None):
             step += 1
             result = run_step(args, mode, rps, index)
             output = export(args, result, step)
+            phase = "warmup" if args.warmup_only else "measure"
             print(json.dumps({"output": str(output), "mode": mode, "rps": rps,
-                              "counts": result.get("measure", {}).get("counts"),
+                              "phase": phase, "counts": result.get(phase, {}).get("counts"),
                               "error": result.get("error")}), flush=True)
             if "error" in result:
                 return 1

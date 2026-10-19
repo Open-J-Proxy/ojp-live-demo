@@ -32,7 +32,7 @@ From the repository root:
 ```bash
 bash scripts/verify-environment.sh
 bash scripts/start.sh
-bash scripts/verify-connections.sh --mode direct
+bash scripts/verify-connections.sh
 bash scripts/death-spiral.sh --mode both --rps 8,16,32,64,128,256 \
   --warmup 30 --duration 60 --max-in-flight 512 \
   --oltp-percent 90 --olap-percent 10 --request-timeout 30 \
@@ -74,6 +74,9 @@ isolated demonstration. Do not expose these services to untrusted networks.
 The application also has an internal control/metrics listener on 8081 so
 diagnostics remain available while workload workers are busy; it is not published.
 Destructive controls must never be used during another person's benchmark.
+Optionally set `ADMIN_TOKEN` to protect control POSTs with a bearer token;
+Compose forwards it to the application and load generator. This does not
+authenticate workload GETs or replace the local-only network boundary.
 
 ## Architecture and verified upstream contracts
 
@@ -163,6 +166,10 @@ Compose resource caps are visible in `compose.yaml`; keep them identical across
 comparisons. The HTTP executor's active workers, queue, rejections and in-flight
 requests are observable. Excess arrivals are not allowed to grow an unbounded
 application or load-generator queue.
+After changing OJP backend pool settings, recreate OJP as well as the application:
+`docker compose up -d --force-recreate ojp app`. Server-owned datasources may
+otherwise retain their original pool configuration. Verify the actual OJP
+maximum/minimum gauges, not just the application's requested settings.
 
 If your network intercepts Maven Central TLS with an enterprise CA, supply the
 trusted **public CA certificate** as a BuildKit secret:
@@ -280,6 +287,7 @@ All scenario wrappers forward these options to the same runner:
 | `--duration` | 60 seconds per level, plus drain |
 | `--max-in-flight` | 512 |
 | `--oltp-percent` / `--olap-percent` | 90 / 10; must total 100 |
+| `--operation-mix` | Optional six-operation percentage CSV; otherwise the default OLTP ratios |
 | `--request-timeout` | 30 seconds |
 | `--seed` | 12345 |
 | `--run-id` | generated unique identifier |
@@ -287,8 +295,15 @@ All scenario wrappers forward these options to the same runner:
 | `--output` | mounted results directory |
 
 OLTP percentage changes rescale the five OLTP shares in the ratio 30:25:20:10:5.
+For independently configured operation shares, pass e.g.
+`--operation-mix browse=30,history=25,checkout=20,review=10,account=5,report=10`.
+All six keys are required; nonnegative integer values must total 100 and agree
+with the requested OLTP/OLAP totals. Zero-weight operations are excluded.
 Invalid modes/rates/percentages/timeouts/concurrency fail before scheduling.
 Rate lists are ordered input, not hardcoded shell loops.
+`bash scripts/warmup.sh --mode both --rps 8 --warmup 30` uses
+`--warmup-only`: it drains and exports warm-up results without starting a
+measurement interval.
 
 ## Demonstration scenarios
 
@@ -319,6 +334,9 @@ execution time; an operation called `report` is **not automatically slow**.
 Inspect real SQL slow-execution and lane metrics; if no query exceeds the
 threshold, report that isolation was not demonstrated. Tune dataset size or the
 threshold explicitly; do not add artificial sleeps.
+Inspect `sum by (sql_statement) (ojp_sql_slow_executions_total)` in Prometheus
+to verify which actual statements were classified; the counter need not exist
+before the first slow execution.
 
 HA uses the driver's comma-separated endpoint syntax. Bound transactions may
 fail when their node dies; OJP does not transparently migrate or safely replay
@@ -339,13 +357,20 @@ Grafana provisioning installs the Prometheus datasource and dashboard without
 manual import. Metrics include:
 
 * `demo_completions_total`, `demo_errors_total`, `demo_rollbacks_total`
+* `demo_load_scheduled_total`, `demo_load_dispatched_total`, `demo_load_dropped_total`,
+  `demo_load_timeouts_total`, `demo_load_inflight` and the scheduled-to-completion
+  histogram `demo_load_latency_seconds_bucket`
 * `demo_request_duration_seconds_bucket`, `demo_acquisition_duration_seconds_bucket`,
   `demo_sql_duration_seconds_bucket`
 * `demo_hikari_active`, `demo_hikari_idle`, `demo_hikari_total`
 * HTTP worker/queue/in-flight gauges and logical connection lifecycle counters
+* `demo_postgres_cpu_percent`, `demo_postgres_memory_percent`, and resource sample
+  timestamps, forwarded from actual Docker stats by the host-side sampler
 * PostgreSQL exporter `pg_stat_database_numbackends`, commits and tuple activity
 * OJP's actual `ojp_hikari_pool_connections_*` gauges, including
   `active_connections`, `idle_connections`, `max_connections`, `pending_threads`
+* `ojp_sql_executions_total` and `ojp_sql_slow_executions_total`
+  (`sql_statement` label); the latter is absent until a slow execution is recorded
 
 OJP's dotted OpenTelemetry instrument names are **not** its scrape names:
 Prometheus adds unit suffixes. Never substitute invented OJP throttling counters
@@ -353,17 +378,29 @@ for metrics missing from this release. Server metrics are server/pool scoped,
 not labeled with benchmark phases; interpret them only within the recorded
 measurement window.
 
+OJP 1.0.3 does **not** export dedicated admission-rejection, fast/slow-lane,
+or JDBC client-throttle Prometheus instruments. Its managers expose internal
+state and logs, but these are not scrapeable counters. The dashboard therefore
+shows real backend pressure and SQL metrics instead of fabricated lane/rejection
+numbers. This release limitation prevents a dedicated OJP-throttling graph;
+client errors/drops and server logs must accompany the pool measurements.
+
 Application histograms carry bounded mode/operation/phase/scenario/RPS labels.
 Run IDs identify exported files, not an unbounded Prometheus label. Select the
 result's **absolute UTC measurement window** in Grafana to avoid mixing runs;
 also select `phase=measure`, mode, scenario and level. Gauge zeroes during the
 inactive connection mode are expected. Histogram quantiles need enough samples
 and scrapes; a very short integration interval is not a reliable P99 estimate.
+Choose a new run ID for each invocation; existing result files are not silently
+reused or merged into a new run.
 
 JSON and CSV in `results/` retain each run/mode/level, warm-up and measured counts,
 per-operation proportions and latency percentiles, errors, configuration, and
-connection-readiness snapshots. CPU/memory evidence is captured separately with
-Docker stats. Do not equate offered RPS with successful SQL throughput or report
+connection-readiness snapshots. CPU/memory evidence is captured with Docker stats,
+retained in JSONL, and graphed through the application metrics endpoint. CPU 100%
+means one core, not the whole host; memory percentage uses the container limit.
+Samples older than ten seconds are filtered from the resource panels rather than
+being displayed as current data. Do not equate offered RPS with successful SQL throughput or report
 only successful latency while ignoring timeouts/drops.
 
 When comparing, report host and container CPU/memory, database capacity and
@@ -441,6 +478,13 @@ FROM pg_stat_activity WHERE datname = 'shop'
 GROUP BY application_name, state ORDER BY application_name, state;
 SELECT * FROM benchmark_seed;
 ```
+
+If Docker resolves a service alias to an address different from
+`docker inspect`, inspect both containers' networks and DNS. During development
+an engine-side stale alias was repaired by `docker compose down` followed by
+startup, preserving named volumes. Do not hardcode container IPs in JDBC URLs.
+For Maven `PKIX path building failed`, use the trusted build CA secret described
+above rather than disabling TLS checks.
 
 ## Known limitations
 
