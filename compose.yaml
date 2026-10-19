@@ -1,0 +1,167 @@
+name: ojp-live-demo
+
+x-ojp: &ojp
+  image: ${OJP_IMAGE:-rrobetti/ojp:1.0.3}
+  environment: &ojp-env
+    JAVA_TOOL_OPTIONS: >-
+      -Xms256m -Xmx768m -Duser.timezone=UTC
+      -Dojp.server.slowQuerySegregation.enabled=${SLOW_QUERY_ENABLED:-false}
+      -Dojp.server.slowQuerySegregation.slowSlotPercentage=20
+      -Dojp.server.slowQuerySegregation.classificationMode=ABSOLUTE_THRESHOLD
+      -Dojp.server.slowQuerySegregation.slowQueryThresholdMs=${SLOW_QUERY_THRESHOLD_MS:-100}
+  depends_on:
+    postgres:
+      condition: service_healthy
+  healthcheck:
+    test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9159/metrics"]
+    interval: 5s
+    timeout: 3s
+    retries: 30
+  mem_limit: 1g
+  cpus: 1.0
+  restart: unless-stopped
+
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:16}
+    environment:
+      POSTGRES_DB: shop
+      POSTGRES_USER: demo
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-demo-local-only}
+    command: ["postgres", "-c", "max_connections=${PG_MAX_CONNECTIONS:-260}", "-c", "shared_buffers=256MB", "-c", "track_io_timing=on"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db:/seed:ro
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U demo -d shop"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    mem_limit: 3g
+    cpus: 2.0
+    shm_size: 512m
+
+  ojp:
+    <<: *ojp
+  ojp2:
+    <<: *ojp
+    profiles: ["ha"]
+  ojp3:
+    <<: *ojp
+    profiles: ["ha"]
+
+  app:
+    build:
+      context: ./app
+      args:
+        MAVEN_IMAGE: ${MAVEN_IMAGE:-maven:3.9.11-eclipse-temurin-21}
+        JAVA_IMAGE: ${JAVA_IMAGE:-eclipse-temurin:21-jre}
+      secrets:
+        - maven_extra_ca
+    environment:
+      PG_URL: jdbc:postgresql://postgres:5432/shop
+      PG_USER: demo
+      PG_PASSWORD: ${DB_PASSWORD:-demo-local-only}
+      OJP_URL: ${OJP_URL:-jdbc:ojp[ojp:1059]_postgresql://postgres:5432/shop?ApplicationName=demo-ojp}
+      DIRECT_POOL_SIZE: ${DIRECT_POOL_SIZE:-200}
+      OJP_POOL_SIZE: ${OJP_POOL_SIZE:-40}
+      OJP_MIN_IDLE: ${OJP_MIN_IDLE:-10}
+      HTTP_WORKERS: ${HTTP_WORKERS:-512}
+      HTTP_QUEUE_SIZE: ${HTTP_QUEUE_SIZE:-1024}
+      STARTUP_TIMEOUT_SECONDS: ${STARTUP_TIMEOUT_SECONDS:-180}
+      TEST_ENDPOINTS: ${TEST_ENDPOINTS:-false}
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-}
+    ports:
+      - "127.0.0.1:${APP_PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ojp:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "java", "-jar", "/app/demo.jar", "--healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 40
+      start_period: 20s
+    mem_limit: 2g
+    cpus: 1.0
+
+  load:
+    build:
+      context: .
+      dockerfile: load/Dockerfile
+    user: "${LOCAL_UID:-1001}:${LOCAL_GID:-1001}"
+    environment:
+      RESULTS_DIR: /results
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-}
+    profiles: ["tools"]
+    volumes:
+      - ${RESULTS_DIR:-./results}:/results
+    depends_on:
+      app:
+        condition: service_healthy
+    mem_limit: 1g
+    cpus: 1.0
+
+  postgres-exporter:
+    image: ${POSTGRES_EXPORTER_IMAGE:-quay.io/prometheuscommunity/postgres-exporter:v0.20.1}
+    environment:
+      DATA_SOURCE_NAME: postgresql://demo:${DB_PASSWORD:-demo-local-only}@postgres:5432/shop?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/bin/postgres_exporter", "--version"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    mem_limit: 128m
+
+  prometheus:
+    image: ${PROMETHEUS_IMAGE:-prom/prometheus:v3.15.0}
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.retention.time=7d"]
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - promdata:/prometheus
+    ports:
+      - "127.0.0.1:${PROMETHEUS_PORT:-9090}:9090"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9090/-/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    mem_limit: 512m
+
+  grafana:
+    image: ${GRAFANA_IMAGE:-grafana/grafana:13.2.4}
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-demo-local-only}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafanadata:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3000/api/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    mem_limit: 512m
+
+volumes:
+  pgdata:
+  promdata:
+  grafanadata:
+
+secrets:
+  maven_extra_ca:
+    file: ${MAVEN_EXTRA_CA:-/dev/null}

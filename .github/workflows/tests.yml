@@ -1,0 +1,86 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  pull_request_review:
+    types: [submitted]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  java-and-python:
+    if: >-
+      github.event_name != 'pull_request_review' ||
+      (github.event.review.state == 'approved' &&
+       github.event.review.commit_id == github.event.pull_request.head.sha)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      COMPOSE_PROJECT_NAME: ci-java
+      SEED_USERS: 200
+      SEED_PRODUCTS: 100
+      SEED_ORDERS: 1000
+      SEED_ITEMS: 3000
+      SEED_REVIEWS: 500
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.event.review.commit_id || github.sha }}
+          persist-credentials: false
+      - name: Python runner tests
+        run: python3 -m unittest discover -s load -p 'test_*.py' -v
+      - name: Start and seed Java test databases
+        run: |
+          bash scripts/verify-environment.sh
+          bash scripts/seed-data.sh
+          docker compose up -d --wait --wait-timeout 180 ojp
+      - name: Java tests including live PostgreSQL and OJP
+        run: |
+          docker run --rm --network "${COMPOSE_PROJECT_NAME}_default" \
+            --volume "$GITHUB_WORKSPACE/app:/build" --workdir /build \
+            --env LIVE_DB_TESTS=true --env PG_PASSWORD=demo-local-only \
+            maven:3.9.11-eclipse-temurin-21 mvn -B verify
+      - name: Collect database logs and clean up
+        if: always()
+        run: |
+          mkdir -p results
+          docker compose logs --no-color > results/java-databases.log 2>&1
+          docker compose down --volumes --remove-orphans
+      - name: Upload Java test reports and database logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: java-test-reports
+          path: |
+            app/target/surefire-reports/
+            results/
+          retention-days: 7
+
+  integration:
+    if: >-
+      github.event_name != 'pull_request_review' ||
+      (github.event.review.state == 'approved' &&
+       github.event.review.commit_id == github.event.pull_request.head.sha)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      COMPOSE_BAKE: "false"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.event.review.commit_id || github.sha }}
+          persist-credentials: false
+      - name: Full integration suite (200 direct sessions)
+        run: bash scripts/test-integration.sh
+      - name: Upload integration evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: integration-evidence
+          path: results/integration/
+          retention-days: 7
