@@ -59,10 +59,9 @@ by side without pretending their database gauges were sampled simultaneously.
 Run IDs remain in JSON/CSV result artifacts, not Prometheus labels.
 
 The Grafana dashboard shows offered/dispatched/completed RPS, server and
-end-to-end latency, OLTP versus OLAP P95, errors/rollbacks/drops, PostgreSQL
-connections and transaction activity, Direct HikariCP and OJP backend pool
-gauges, logical connections, OJP SQL classifications, and PostgreSQL CPU and
-memory. Grafana provisioning is in
+end-to-end latency, OLTP versus OLAP P95, errors/rollbacks/drops, Direct
+HikariCP and OJP backend pool gauges, logical connections, OJP SQL
+classifications, and PostgreSQL CPU and memory. Grafana provisioning is in
 `monitoring/grafana/provisioning/`.
 
 OJP's scrape endpoint also exports live pool gauges and actual SQL execution /

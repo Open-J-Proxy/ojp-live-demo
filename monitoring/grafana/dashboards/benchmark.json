@@ -20,10 +20,6 @@
       {"expr":"sum by(mode)(rate(demo_completions_total{mode=~\"$mode\",phase=\"$phase\",scenario=~\"$scenario\",level=~\"$level\"}[30s]))","legendFormat":"{{mode}} success"},
       {"expr":"sum by(mode)(rate(demo_errors_total{mode=~\"$mode\",phase=\"$phase\",scenario=~\"$scenario\",level=~\"$level\"}[30s]))","legendFormat":"{{mode}} errors"},
       {"expr":"sum by(mode)(rate(demo_rollbacks_total{mode=~\"$mode\",phase=\"$phase\",scenario=~\"$scenario\",level=~\"$level\"}[30s]))","legendFormat":"{{mode}} rollbacks"}]},
-    {"id":5,"type":"timeseries","title":"PostgreSQL connections and transaction activity","datasource":{"uid":"prometheus","type":"prometheus"},"gridPos":{"x":12,"y":10,"w":12,"h":7},"targets":[
-      {"expr":"pg_stat_database_numbackends{datname=\"shop\"}","legendFormat":"sessions"},
-      {"expr":"rate(pg_stat_database_xact_commit{datname=\"shop\"}[30s])","legendFormat":"commits/s"},
-      {"expr":"rate(pg_stat_database_tup_returned{datname=\"shop\"}[30s])","legendFormat":"tuples returned/s"}]},
     {"id":6,"type":"timeseries","title":"Direct HikariCP physical pool","datasource":{"uid":"prometheus","type":"prometheus"},"gridPos":{"x":0,"y":17,"w":12,"h":7},"targets":[
       {"expr":"demo_hikari_active","legendFormat":"active"},{"expr":"demo_hikari_idle","legendFormat":"idle"},{"expr":"demo_hikari_total","legendFormat":"total"}]},
     {"id":7,"type":"timeseries","title":"OJP backend physical pool (live server metrics)","datasource":{"uid":"prometheus","type":"prometheus"},"gridPos":{"x":12,"y":17,"w":12,"h":7},"targets":[
