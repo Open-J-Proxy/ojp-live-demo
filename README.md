@@ -92,32 +92,24 @@ list. Results are written as JSON and CSV under `results/`.
 
 ```mermaid
 flowchart LR
-    Operator["Operator"] --> Start["scripts/start.sh"]
-    Operator --> HTAP["scripts/htap.sh"]
-    Start --> Compose["Docker Compose"]
-    Compose --> PG[("PostgreSQL<br/>shop database")]
-    Compose --> App["Java ShopService demo<br/>HTTP workers + admin API"]
-    Compose --> OJP["OJP server<br/>slow-query segregation<br/>20% slow lane"]
-    Compose --> Exporter["postgres-exporter"]
-    Compose --> Prom["Prometheus"]
-    Compose --> Grafana["Grafana<br/>benchmark dashboard"]
-    Seed["scripts/seed-data.sh"] --> PG
-    HTAP --> Load["Python open-loop load runner"]
-    Load -->|"work requests :8080"| App
-    Load -->|"mode / reset / context / arrivals :8081"| App
-    App -->|"Direct JDBC<br/>HikariCP min=max 200"| PG
-    App -->|"OJP JDBC logical connection<br/>create/close per transaction"| OJP
-    OJP -->|"backend pool min=max 10"| PG
+    subgraph Compose["Docker Compose"]
+        App["Java ShopService app"]
+        OJP["OJP server"]
+        PG[("PostgreSQL")]
+        Exporter["postgres-exporter"]
+        Prom["Prometheus"]
+        Grafana["Grafana"]
+    end
+    Load["Python open-loop load runner"] --> App
+    App -->|"Direct JDBC"| PG
+    App -->|"OJP JDBC"| OJP
+    OJP --> PG
     PG --> Exporter
-    App -->|"application metrics :8081"| Prom
-    OJP -->|"pool + SQL metrics :9159"| Prom
+    App --> Prom
+    OJP --> Prom
     Exporter --> Prom
-    Docker["Docker Engine"] -->|"container stats"| Sampler["Host resource sampler"]
-    Sampler -->|"CPU/memory snapshots"| App
-    Sampler --> Results["JSONL resource evidence"]
-    Load --> Results2["Per-mode / per-RPS JSON and CSV"]
-    Results --> Results2
     Prom --> Grafana
+    Sampler["Host resource sampler"] --> App
 ```
 
 Direct JDBC and OJP are exercised sequentially by the same runner. The app
