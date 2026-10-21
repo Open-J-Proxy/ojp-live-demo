@@ -5,10 +5,12 @@ from contextlib import redirect_stderr, redirect_stdout
 import csv
 import http.server
 import io
+import importlib.util
 import itertools
 import json
 import os
 from pathlib import Path
+import subprocess
 import threading
 import time
 import unittest
@@ -50,7 +52,9 @@ class RunnerTests(unittest.TestCase):
                      ["--control-timeout", "0"],
                      ["--oltp-percent", "80"], ["--olap-percent", "101"],
                      ["--mode", "invalid"], ["--url", "app:8080"],
-                     ["--scenario", "arbitrary"], ["--rps", "2.5"], ["--rps", "10001"],
+                     ["--scenario", "arbitrary"], ["--mo", "direct"],
+                     ["--warmup-o"], ["--scen", "integration"],
+                     ["--rps", "2.5"], ["--rps", "10001"],
                      ["--rps", ",".join(map(str, range(1, 66)))]):
             with self.subTest(argv=argv), redirect_stderr(io.StringIO()):
                 with self.assertRaises(SystemExit):
@@ -99,17 +103,64 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("export OJP_SLOW_QUERY_SEGREGATION_VERIFIED=true", script)
         self.assertIn("-Dojp.server.slowQuerySegregation.enabled=true", script)
         self.assertIn("-Dojp.server.slowQuerySegregation.slowSlotPercentage=20", script)
-        self.assertIn("--mode both --rps 8,256,8,8 --warmup 10 --duration 30", script)
+        self.assertIn("--rps 8,256,8,8 --warmup 10 --duration 30", script)
         self.assertIn("--oltp-percent 98 --olap-percent 2", script)
-        self.assertIn("run_load htap", script)
+        self.assertIn('python3 "$SCRIPT_DIR/resources.py" "$@"', script)
         self.assertIn("```mermaid", readme)
         for component in ("Docker Compose", "PostgreSQL", "OJP server", "Prometheus",
                           "Grafana", "postgres-exporter", "Host resource sampler",
                           "Python open-loop load runner"):
             self.assertIn(component, readme)
-        for old in ("death-spiral.sh", "slow-queries.sh", "throttling.sh", "compare.sh"):
+        for old in ("death-spiral.sh", "slow-queries.sh", "throttling.sh", "compare.sh",
+                    "failover.sh", "warmup.sh"):
             self.assertFalse((root / "scripts" / old).exists())
             self.assertNotIn(old, readme)
+
+    def test_htap_rejects_alternate_modes_before_docker(self):
+        script = Path(__file__).resolve().parent.parent / "scripts" / "htap.sh"
+        for options in (["--scenario", "failover"], ["--scenario=integration"],
+                        ["--mode", "direct"], ["--mode=ojp"], ["--warmup-only"]):
+            with self.subTest(options=options):
+                result = subprocess.run(["bash", str(script), *options],
+                                        capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("HTAP always measures Direct JDBC then OJP", result.stderr)
+
+    def test_htap_rebuilds_runner_before_sampling_and_running(self):
+        path = Path(__file__).resolve().parent.parent / "scripts" / "resources.py"
+        spec = importlib.util.spec_from_file_location("htap_resources", path)
+        resources = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(resources)
+        events = MagicMock()
+        with patch.object(resources.subprocess, "run") as build, \
+                patch.object(resources.subprocess, "call", return_value=7) as run, \
+                patch.object(resources, "ResourceSampler") as sampler, \
+                patch.object(resources.sys, "argv", [
+                    str(path), "--run-id", "test-htap", "--rps", "2"]):
+            sampler.return_value.path = Path("/results/test-htap/resources.jsonl")
+            events.attach_mock(build, "build")
+            events.attach_mock(sampler, "sampler")
+            events.attach_mock(run, "run")
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(resources.main(), 7)
+            build.assert_called_once_with(
+                resources.COMPOSE + ["--profile", "tools", "build", "load"], check=True)
+            self.assertEqual([call[0] for call in events.mock_calls],
+                             ["build", "sampler", "sampler().start", "run",
+                              "sampler().stop"])
+            command = run.call_args.args[0]
+            self.assertEqual(command[-4:], ["--scenario", "htap", "--mode", "both"])
+            self.assertEqual(command[command.index("--rps") + 1], "2")
+
+        with patch.object(resources.subprocess, "run",
+                          side_effect=subprocess.CalledProcessError(1, "build")), \
+                patch.object(resources.subprocess, "call") as run, \
+                patch.object(resources, "ResourceSampler") as sampler, \
+                patch.object(resources.sys, "argv", [str(path)]):
+            with self.assertRaises(subprocess.CalledProcessError):
+                resources.main()
+            run.assert_not_called()
+            sampler.assert_not_called()
 
     def test_ojp_slow_query_counter_reports_observed_statement_deltas(self):
         body = ('ojp_sql_slow_executions_total{sql_statement="select report"} 4\n'

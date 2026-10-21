@@ -127,19 +127,19 @@ class ResourceSampler:
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("scenario")
-    args, forwarded = parser.parse_known_args()
-    metadata = argparse.ArgumentParser(add_help=False)
+    forwarded = sys.argv[1:]
+    metadata = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     metadata.add_argument("--run-id", default=uuid.uuid4().hex[:12])
     run, _ = metadata.parse_known_args(forwarded)
     output = os.environ.get("RESULTS_DIR", str(ROOT / "results"))
+    subprocess.run(COMPOSE + ["--profile", "tools", "build", "load"], check=True)
     sampler = ResourceSampler(output, run.run_id)
     command = COMPOSE + ["--profile", "tools", "run", "--rm", "--user",
                          os.environ.get("LOCAL_UID", str(os.getuid())) + ":"
                          + os.environ.get("LOCAL_GID", str(os.getgid())),
                          "load", "--output", "/results",
-                         "--scenario", args.scenario, "--run-id", run.run_id, *forwarded]
+                         "--run-id", run.run_id, *forwarded,
+                         "--scenario", "htap", "--mode", "both"]
     sampler.start()
     try:
         return subprocess.call(command)

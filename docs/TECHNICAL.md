@@ -33,6 +33,11 @@ with the same seed, reset baseline, request plan, and RPS levels.
 `slowSlotPercentage=20`, absolute-threshold classification, and a configurable
 positive threshold (`SLOW_QUERY_THRESHOLD_MS`, default 100). It verifies the
 running container environment and JVM startup options before generating load.
+This is the only benchmark entrypoint and always measures Direct JDBC followed
+by OJP. It rebuilds the load image from the current checkout before starting
+the runner, preventing obsolete cached CLI options from breaking the run.
+Single-path and warmup-only runner controls remain internal to regression tests;
+HA fault orchestration is invoked directly by the integration suite.
 The runner compares OJP's real `ojp_sql_slow_executions_total` counters around
 the measurement. No observed classifications are reported as “not
 demonstrated”; configuration by itself is not treated as evidence that SQL

@@ -47,9 +47,3 @@ wait_app() {
   python3 "$SCRIPT_DIR/http_client.py" ready --url "$(application_url)" \
     --timeout "${START_TIMEOUT:-180}"
 }
-run_load() {
-  local scenario="$1"; shift
-  preflight
-  mkdir -p "$RESULTS_DIR"
-  python3 "$SCRIPT_DIR/resources.py" "$scenario" "$@"
-}
