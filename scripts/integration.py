@@ -674,7 +674,7 @@ class Integration(unittest.TestCase):
                 self.assertEqual(response.get("status"), "success", (expression, response))
 
     def test_15_ha_failover_bounded_sql_recovery(self):
-        E.run([SCRIPT / "failover.sh", "--run-id", "it-failover", "--rps", "10",
+        E.run([sys.executable, SCRIPT / "failover.py", "--run-id", "it-failover", "--rps", "10",
                "--warmup", "1", "--duration", "8", "--recovery-timeout", "60"], timeout=600)
         E.refresh_base()
         report = json.loads((E.output / "it-failover-failover-events.json").read_text())
@@ -816,7 +816,7 @@ class Integration(unittest.TestCase):
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
 
     def test_22_htap_entrypoint_verifies_segregation_and_keeps_both_results(self):
-        E.run([SCRIPT / "htap.sh", "--mode", "both", "--rps", "2",
+        E.run([SCRIPT / "htap.sh", "--rps", "2",
                "--warmup", "0", "--duration", "5", "--max-in-flight", "32",
                "--request-timeout", "15", "--run-id", "it-htap"], timeout=300)
         results = [json.loads(path.read_text())

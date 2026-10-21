@@ -58,7 +58,7 @@ bash scripts/htap.sh
 This is equivalent to:
 
 ```bash
-bash scripts/htap.sh --mode both \
+bash scripts/htap.sh \
   --rps 8,256,8,8 \
   --warmup 10 --duration 30 \
   --oltp-percent 98 --olap-percent 2
@@ -76,7 +76,12 @@ while still exercising real analytical queries. OJP segregation is mandatory,
 with a 20% slow lane. If no slow SQL classification is observed, the result
 states that isolation was not demonstrated.
 
-Options include `--mode direct|ojp|both`, `--rps` with an ordered comma-separated
+`htap.sh` is the only benchmark entrypoint: it always measures Direct JDBC
+followed by OJP, with no scenario, single-path, or warmup-only modes. It rebuilds
+the load image before each run so an older cached runner cannot reject the HTAP
+scenario. The separate integration suite is for automated regression coverage.
+
+Options include `--rps` with an ordered comma-separated
 sequence, `--warmup`, `--duration`, `--request-timeout` for measured requests,
 `--control-timeout` for mode switches and controls, `--max-in-flight`, `--seed`,
 `--oltp-percent`/`--olap-percent`, and `--operation-mix`. Defaults are 98% OLTP

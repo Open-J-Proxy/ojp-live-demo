@@ -6,20 +6,22 @@ if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
   cat <<'EOF'
 Usage: scripts/htap.sh [load-runner options]
 Runs the sequential Direct JDBC/HikariCP versus OJP HTAP comparison.
-Defaults: --mode both --rps 8,256,8,8 --warmup 10 --duration 30
+Defaults: --rps 8,256,8,8 --warmup 10 --duration 30
           --oltp-percent 98 --olap-percent 2
 The rate profile applies low traffic, a sharp spike, then two low-load windows
 for post-spike observations. Each rate level has its own baseline reset,
 warm-up, and measurement interval.
 OJP slow-query segregation is mandatory with a 20% slow lane.
+Both connection paths always run; scenario, mode, and warmup-only selection
+are not supported by this entrypoint.
 EOF
   exit 0
 fi
 
 for argument in "$@"; do
   case "$argument" in
-    --scenario|--scenario=*)
-      echo 'The HTAP benchmark scenario is fixed; workload selection uses the OLTP/OLAP mix options.' >&2
+    --scenario|--scenario=*|--mode|--mode=*|--warmup-only|--warmup-only=*)
+      echo 'HTAP always measures Direct JDBC then OJP; scenario, mode, and warmup-only selection are not supported.' >&2
       exit 2
       ;;
   esac
@@ -64,4 +66,5 @@ for property in \
 done
 
 export OJP_SLOW_QUERY_SEGREGATION_VERIFIED=true
-run_load htap "$@"
+mkdir -p "$RESULTS_DIR"
+python3 "$SCRIPT_DIR/resources.py" "$@"

@@ -93,6 +93,7 @@ def operation_mix(value):
 
 def parser():
     result = argparse.ArgumentParser(
+        allow_abbrev=False,
         description=__doc__,
         epilog="Default profile: --mode both --rps 8,256,8,8 --warmup 10 --duration 30 "
                "--oltp-percent 98 --olap-percent 2. Each mode/rate resets, warms up, "
