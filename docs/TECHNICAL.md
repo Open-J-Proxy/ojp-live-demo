@@ -53,8 +53,9 @@ application-owned Direct sessions and OJP backend sessions by mode.
 At each successful measurement, the load runner publishes a saved summary
 labelled by mode, scenario, phase, and RPS level: successful throughput, OLTP
 and OLAP P95, error percentage, dropped requests, physical connections, and
-PostgreSQL CPU. This allows sequential Direct/OJP results to appear side by
-side without pretending their database gauges were sampled simultaneously.
+PostgreSQL CPU as `demo_benchmark_result_*` Prometheus series (not shown on the
+Grafana dashboard). This allows sequential Direct/OJP results to be compared side
+by side without pretending their database gauges were sampled simultaneously.
 Run IDs remain in JSON/CSV result artifacts, not Prometheus labels.
 
 The Grafana dashboard shows offered/dispatched/completed RPS, server and
