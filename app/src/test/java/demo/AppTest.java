@@ -43,6 +43,17 @@ class AppTest {
         stats.completed.increment(); stats.request.record(10_000_000);
         String text = m.render(Map.of());
         assertTrue(text.contains("demo_completions_total{mode=\"direct\",op=\"browse\",phase=\"measure\",scenario=\"integration\",level=\"1\"} 1"));
+        m.connectionOpened("direct");
+        m.connectionClosed("direct");
+        m.connectionOpened("ojp");
+        m.physicalConnections(200, 40);
+        text = m.render(Map.of());
+        assertTrue(text.contains("demo_logical_connections_opened_total{mode=\"direct\"} 1"));
+        assertTrue(text.contains("demo_logical_connections_closed_total{mode=\"direct\"} 1"));
+        assertTrue(text.contains("demo_logical_connections_opened_total{mode=\"ojp\"} 1"));
+        assertTrue(text.contains("demo_postgres_physical_connections{mode=\"direct\"} 200"));
+        assertTrue(text.contains("demo_postgres_physical_connections{mode=\"ojp\"} 40"));
+        assertFalse(text.contains("demo_logical_connections_opened_total 2"));
         assertTrue(text.contains("le=\"+Inf\"} 1"));
         assertTrue(text.contains("le=\"0.001\"} 0"));
         m.updateContext(m.context("warmup", "integration", 1), true);
@@ -101,6 +112,20 @@ class AppTest {
         assertThrows(IllegalArgumentException.class, () -> new Metrics.Latency(1, 80, buckets));
     }
 
+    @Test void measuredBenchmarkResultsAreModeAndLevelScoped() {
+        Metrics metrics = new Metrics();
+        Metrics.Context context = metrics.context("measure", "htap", 16);
+        metrics.benchmarkResult("direct", context, new Metrics.BenchmarkResult(
+                15, 20, 200, 1, 2, 200, 65, 0));
+        metrics.benchmarkResult("ojp", context, new Metrics.BenchmarkResult(
+                16, 15, 180, 0, 0, 40, 55, 3));
+        String text = metrics.render(Map.of());
+        assertTrue(text.contains("demo_benchmark_result_successful_rps{mode=\"direct\",phase=\"measure\",scenario=\"htap\",level=\"16\"} 15.0"));
+        assertTrue(text.contains("demo_benchmark_result_physical_connections{mode=\"ojp\",phase=\"measure\",scenario=\"htap\",level=\"16\"} 40.0"));
+        assertThrows(IllegalArgumentException.class, () -> metrics.benchmarkResult("direct",
+                metrics.context("warmup", "htap", 16), new Metrics.BenchmarkResult(1, 1, 1, 0, 0, 1, 1, 0)));
+    }
+
     @Test void twoHundredRequestsExecuteConcurrentlyWithoutDatabase() throws Exception {
         int port = freePort(), adminPort = freePort();
         while (port == adminPort) adminPort = freePort();
@@ -140,7 +165,8 @@ class AppTest {
             }
             for (var hold : holds) assertEquals(200, hold.get(20, TimeUnit.SECONDS).statusCode());
             assertTrue(metrics.contains("demo_hold_peak 200\n"), metrics);
-            assertTrue(metrics.contains("demo_logical_connections_opened_total 0\n"));
+            assertTrue(metrics.contains("demo_logical_connections_opened_total{mode=\"direct\"} 0\n"));
+            assertTrue(metrics.contains("demo_logical_connections_opened_total{mode=\"ojp\"} 0\n"));
             assertTrue(metrics.contains("demo_postgres_cpu_percent 12.5\n"));
             assertTrue(metrics.contains("demo_postgres_memory_percent 8.75\n"));
             assertTrue(metrics.contains("benchmark_load_scheduled_total{mode=\"direct\",phase=\"measure\",scenario=\"integration\",level=\"10\"} 10"));

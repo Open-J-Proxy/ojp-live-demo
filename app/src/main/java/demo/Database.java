@@ -11,6 +11,7 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 final class Database implements AutoCloseable {
     private static final org.postgresql.Driver POSTGRES_DRIVER = new org.postgresql.Driver();
+    private static final String DIRECT_APPLICATION_NAME = "demo-direct-" + UUID.randomUUID().toString().substring(0, 8);
     private final Config config;
     private final Metrics metrics;
     private final ReentrantReadWriteLock gate = new ReentrantReadWriteLock(true);
@@ -21,6 +22,8 @@ final class Database implements AutoCloseable {
     private volatile int directSessions = -1;
     private volatile String lastError = "";
     private volatile int postgresMaxConnections = -1, postgresSessions = -1, postgresActiveSessions = -1;
+    private volatile int ojpSessions = -1;
+    private volatile double postgresSnapshotTimestampSeconds;
 
     Database(Config config, Metrics metrics) { this.config = config; this.metrics = metrics; }
 
@@ -87,8 +90,17 @@ final class Database implements AutoCloseable {
         try {
             if (direct != null) { direct.close(); direct = null; }
             diagnostic = "Waiting for direct sessions to disappear";
+            long graceDeadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
+            boolean terminationAttempted = false;
             while (sessionCount() != 0) {
-                checkDeadline(deadline);
+                if (!terminationAttempted && System.nanoTime() >= graceDeadline) {
+                    diagnostic = "Terminating leftover sessions owned by " + DIRECT_APPLICATION_NAME;
+                    terminateOwnedDirectSessions();
+                    terminationAttempted = true;
+                }
+                if (System.nanoTime() >= deadline)
+                    throw new TimeoutException("Direct PostgreSQL sessions remain after pool close: "
+                            + directSessions + " owned by " + DIRECT_APPLICATION_NAME);
                 Thread.sleep(100);
             }
             mode = next;
@@ -129,13 +141,13 @@ final class Database implements AutoCloseable {
     private HikariDataSource pool() {
         HikariConfig h = new HikariConfig();
         h.setDriverClassName("org.postgresql.Driver");
-        h.setJdbcUrl(Config.applicationName(config.pgUrl(), "demo-direct"));
+        h.setJdbcUrl(Config.applicationName(config.pgUrl(), DIRECT_APPLICATION_NAME));
         h.setUsername(config.pgUser()); h.setPassword(config.pgPassword());
         h.setPoolName("demo-direct");
         h.setMaximumPoolSize(config.poolSize()); h.setMinimumIdle(config.poolSize());
         h.setInitializationFailTimeout(-1); h.setConnectionTimeout(Math.min(30000L, config.startupSeconds() * 1000L));
         h.setMaxLifetime(0); h.setIdleTimeout(0);
-        h.addDataSourceProperty("ApplicationName", "demo-direct");
+        h.addDataSourceProperty("ApplicationName", DIRECT_APPLICATION_NAME);
         h.addDataSourceProperty("connectTimeout", "5");
         h.addDataSourceProperty("socketTimeout", Integer.toString(config.sqlTimeoutSeconds() + 10));
         return new HikariDataSource(h);
@@ -167,8 +179,19 @@ final class Database implements AutoCloseable {
         try (Connection c = admin()) {
             refreshPostgresDiagnostics(c);
             directSessions = Math.toIntExact(scalar(c,
-                    "SELECT count(*) FROM pg_stat_activity WHERE application_name='demo-direct' AND datname=current_database()"));
+                    "SELECT count(*) FROM pg_stat_activity WHERE application_name='" + DIRECT_APPLICATION_NAME
+                            + "' AND datname=current_database()"));
             return directSessions;
+        }
+    }
+
+    private void terminateOwnedDirectSessions() throws SQLException {
+        try (Connection c = admin();
+             PreparedStatement p = c.prepareStatement("SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                     + "WHERE application_name=? AND datname=current_database() AND usename=? AND pid<>pg_backend_pid()")) {
+            p.setString(1, DIRECT_APPLICATION_NAME);
+            p.setString(2, config.pgUser());
+            p.execute();
         }
     }
 
@@ -179,7 +202,8 @@ final class Database implements AutoCloseable {
                 refreshPostgresDiagnostics(c);
                 dbOk = scalar(c, "SELECT 1") == 1;
                 directSessions = Math.toIntExact(scalar(c,
-                        "SELECT count(*) FROM pg_stat_activity WHERE application_name='demo-direct' AND datname=current_database()"));
+                        "SELECT count(*) FROM pg_stat_activity WHERE application_name='" + DIRECT_APPLICATION_NAME
+                                + "' AND datname=current_database()"));
             } catch (SQLException ignored) {}
         }
         Map<String, Object> result = new LinkedHashMap<>();
@@ -188,11 +212,16 @@ final class Database implements AutoCloseable {
         result.put("database", dbOk); result.put("direct_sessions", directSessions);
         result.put("direct_pool_target", config.poolSize());
         result.put("ojp_pool_max", config.ojpPoolSize()); result.put("ojp_pool_min", config.ojpMinIdle());
-        result.put("logical_open", metrics.opened.sum() - metrics.closed.sum());
+        result.put("ojp_sessions", ojpSessions);
+        result.put("logical_open", metrics.logicalOpen(mode.equals("ojp") ? "ojp" : "direct"));
+        result.put("logical_open_by_mode", Map.of("direct", metrics.logicalOpen("direct"),
+                "ojp", metrics.logicalOpen("ojp")));
+        result.put("direct_application_name", DIRECT_APPLICATION_NAME);
         result.put("last_error", lastError);
         result.put("postgres_max_connections", postgresMaxConnections);
         result.put("postgres_sessions", postgresSessions);
         result.put("postgres_active_sessions", postgresActiveSessions);
+        result.put("postgres_snapshot_timestamp_seconds", postgresSnapshotTimestampSeconds);
         return result;
     }
 
@@ -203,6 +232,12 @@ final class Database implements AutoCloseable {
              ResultSet r = p.executeQuery()) {
             r.next(); postgresMaxConnections = r.getInt(1); postgresSessions = r.getInt(2); postgresActiveSessions = r.getInt(3);
         }
+        directSessions = Math.toIntExact(scalar(c, "SELECT count(*) FROM pg_stat_activity WHERE application_name='"
+                + DIRECT_APPLICATION_NAME + "' AND datname=current_database()"));
+        ojpSessions = Math.toIntExact(scalar(c,
+                "SELECT count(*) FROM pg_stat_activity WHERE application_name='demo-ojp' AND datname=current_database()"));
+        postgresSnapshotTimestampSeconds = System.currentTimeMillis() / 1000.0;
+        metrics.physicalConnections(directSessions, ojpSessions);
     }
 
     private String describe(Throwable error) {
@@ -222,13 +257,16 @@ final class Database implements AutoCloseable {
     Map<String, Number> gauges() {
         Map<String, Number> result = new LinkedHashMap<>();
         result.put("ready", ready ? 1 : 0); result.put("direct_sessions", directSessions);
+        result.put("postgres_sessions", postgresSessions);
+        result.put("postgres_active_sessions", postgresActiveSessions);
         HikariDataSource pool = direct;
         var bean = pool == null ? null : pool.getHikariPoolMXBean();
         result.put("hikari_active", bean == null ? 0 : bean.getActiveConnections());
         result.put("hikari_idle", bean == null ? 0 : bean.getIdleConnections());
         result.put("hikari_total", bean == null ? 0 : bean.getTotalConnections());
         result.put("hikari_pending", bean == null ? 0 : bean.getThreadsAwaitingConnection());
-        result.put("logical_open", metrics.opened.sum() - metrics.closed.sum());
+        result.put("logical_open", metrics.logicalOpen(mode.equals("ojp") ? "ojp" : "direct"));
+        result.put("direct_physical_connections", directSessions);
         return result;
     }
 
@@ -243,10 +281,12 @@ final class Database implements AutoCloseable {
             try {
                 c = transactionMode.equals("direct") ? direct.getConnection()
                         : DriverManager.getConnection(config.ojpUrl(), config.ojpProperties());
-                metrics.opened.increment();
+                metrics.connectionOpened(transactionMode);
             } finally { stats.acquisition.record(System.nanoTime() - acquireStart); }
             long rows = 0;
-            try (AutoCloseable resource = () -> { c.close(); metrics.closed.increment(); }) {
+            try (AutoCloseable resource = () -> {
+                try { c.close(); } finally { metrics.connectionClosed(transactionMode); }
+            }) {
                 long sqlStart = System.nanoTime();
                 try {
                     c.setAutoCommit(false);

@@ -362,10 +362,13 @@ class Integration(unittest.TestCase):
     def test_07_direct_200_simultaneous_physical_sessions(self):
         E.mode("direct")
         expected_pool = int(E.env["DIRECT_POOL_SIZE"])
+        application_name = E.call("/ready")[1]["direct_application_name"]
         physical = int(E.sql("SELECT count(*) FROM pg_stat_activity WHERE "
-                             "datname=current_database() AND application_name='demo-direct'"))
+                             "datname=current_database() AND application_name='"
+                             + application_name + "'"))
         self.assertEqual(physical, expected_pool)
-        opened_before = metric_rows(E.metrics(), "demo_logical_connections_opened_total")[0][1]
+        opened_before = sum(value for labels, value in metric_rows(
+            E.metrics(), "demo_logical_connections_opened_total") if labels.get("mode") == "direct")
         barrier = threading.Barrier(E.sessions + 1)
         def hold():
             barrier.wait(timeout=30)
@@ -389,7 +392,8 @@ class Integration(unittest.TestCase):
             "physical_sessions": physical, "small_profile": E.options.small}))
         self.assertGreaterEqual(peak, E.sessions,
                                 f"Expected {E.sessions} simultaneous HTTP handlers, observed {peak}")
-        self.assertEqual(metric_rows(E.metrics(), "demo_logical_connections_opened_total")[0][1],
+        self.assertEqual(sum(value for labels, value in metric_rows(
+            E.metrics(), "demo_logical_connections_opened_total") if labels.get("mode") == "direct"),
                          opened_before, "/hold must not manufacture database work")
 
     def test_08_logical_connection_lifecycle_balanced(self):
@@ -401,25 +405,28 @@ class Integration(unittest.TestCase):
         opened = metric_rows(metrics, "demo_logical_connections_opened_total")
         closed = metric_rows(metrics, "demo_logical_connections_closed_total")
         self.assertTrue(opened and closed)
-        self.assertGreater(opened[0][1], 0)
-        self.assertEqual(opened[0][1], closed[0][1])
+        for mode in ("direct", "ojp"):
+            opened_count = sum(value for labels, value in opened if labels.get("mode") == mode)
+            closed_count = sum(value for labels, value in closed if labels.get("mode") == mode)
+            self.assertGreater(opened_count, 0, mode)
+            self.assertEqual(opened_count, closed_count, mode)
 
     def test_09_ojp_multiplexes_bounded_physical_pool(self):
         E.mode("ojp")
-        self.assertEqual(E.sql("SELECT count(*) FROM pg_stat_activity WHERE application_name='demo-direct'"), "0")
+        self.assertEqual(E.sql("SELECT count(*) FROM pg_stat_activity WHERE application_name LIKE 'demo-direct-%'"), "0")
         for name in ("demo_hikari_total", "demo_hikari_active", "demo_hikari_idle"):
             self.assertEqual(metric_rows(E.metrics(), name)[0][1], 0)
         concurrency = 60 if not E.options.small else 20
         barrier = threading.Barrier(concurrency + 1)
         def hold():
             barrier.wait(timeout=30)
-            return E.work("report", scenario="slow-queries")
+            return E.work("report", scenario="htap")
         peak = 0
         successes = rejected = 0
         def completed():
             return sum(value for labels, value in metric_rows(E.metrics(), "demo_completions_total")
                        if labels.get("mode") == "ojp" and labels.get("op") == "report"
-                       and labels.get("scenario") == "slow-queries")
+                       and labels.get("scenario") == "htap")
         before_completed = completed()
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
             futures = [executor.submit(hold) for _ in range(concurrency)]
@@ -471,7 +478,7 @@ class Integration(unittest.TestCase):
 
     def test_11_ordered_sequential_comparison_and_metadata(self):
         results = E.runner("it-compare", "--mode", "both", "--rps", "3,7",
-                           "--warmup", "1", "--duration", "2", "--seed", "4242",
+                           "--warmup", "1", "--duration", "5", "--seed", "4242",
                            "--max-in-flight", "17", "--request-timeout", "45")
         self.assertEqual([(item["mode"], item["rps"]) for item in results],
                          [("direct", 3), ("direct", 7), ("ojp", 3), ("ojp", 7)])
@@ -488,7 +495,8 @@ class Integration(unittest.TestCase):
             self.assertEqual(item["readiness_after"]["status"], 200)
             self.assertEqual(item["metrics_before_measure"]["status"], 200)
             self.assertEqual(item["metrics_after"]["status"], 200)
-            for phase, duration in (("warmup", 1), ("measure", 2)):
+            self.assertTrue(item.get("benchmark_result_published"), item)
+            for phase, duration in (("warmup", 1), ("measure", 5)):
                 report = item[phase]
                 self.assertLessEqual(report["start_epoch_seconds"], report["end_arrivals_epoch_seconds"])
                 self.assertLessEqual(report["end_arrivals_epoch_seconds"], report["end_epoch_seconds"])
@@ -542,9 +550,16 @@ class Integration(unittest.TestCase):
             self.assertEqual(
                 {op: value["scheduled"] for op, value in direct["measure"]["operations"].items()},
                 {op: value["scheduled"] for op, value in ojp["measure"]["operations"].items()})
+        summary_metrics = E.metrics()
+        for item in results:
+            labels = {"mode": item["mode"], "phase": "measure",
+                      "scenario": item["scenario"], "level": item["level"]}
+            self.assertTrue(any(all(row_labels.get(key) == value for key, value in labels.items())
+                                for row_labels, _ in metric_rows(
+                                    summary_metrics, "demo_benchmark_result_successful_rps")))
 
     def test_12_throttling_admission_not_sql_completion(self):
-        results = E.runner("it-throttle", "--scenario", "slow-queries", "--mode", "direct",
+        results = E.runner("it-throttle", "--scenario", "integration", "--mode", "direct",
                            "--rps", "1000", "--warmup", "0", "--duration", "2",
                            "--max-in-flight", "1", "--request-timeout", "30")
         self.assertEqual(len(results), 1)
@@ -556,6 +571,10 @@ class Integration(unittest.TestCase):
         self.assertLessEqual(counts["peak_in_flight"], 1)
         self.assertEqual(counts["accepted"], counts["sql_completed"])
         self.assertLess(counts["sql_completed"], counts["scheduled"])
+        E.mode("ojp")
+        switched = E.call("/ready")[1]
+        self.assertEqual(switched["direct_sessions"], 0, switched)
+        self.assertEqual(switched["mode"], "ojp", switched)
 
     def test_13_analytical_queries_execute_real_aggregations(self):
         def server_counts():
@@ -573,13 +592,13 @@ class Integration(unittest.TestCase):
             E.reset()
             before = sum(value for labels, value in metric_rows(E.metrics(), "demo_completions_total")
                          if labels.get("mode") == mode and labels.get("op") == "report"
-                         and labels.get("scenario") == "slow-queries")
-            result = self.success(E.work("report", scenario="slow-queries"))
+                         and labels.get("scenario") == "htap")
+            result = self.success(E.work("report", scenario="htap"))
             result_rows[mode] = result["rows"]
             self.assertGreater(result["rows"], 0, "Sales aggregation must return real product groups")
             after = sum(value for labels, value in metric_rows(E.metrics(), "demo_completions_total")
                         if labels.get("mode") == mode and labels.get("op") == "report"
-                        and labels.get("scenario") == "slow-queries")
+                        and labels.get("scenario") == "htap")
             self.assertEqual(after - before, 1)
             E.reset()
         self.assertEqual(result_rows["direct"], result_rows["ojp"])
@@ -643,6 +662,16 @@ class Integration(unittest.TestCase):
         self.assertEqual(status, 200, body)
         self.assertTrue(body["data"]["result"], body)
         self.assertGreater(float(body["data"]["result"][0]["value"][1]), 0)
+        dashboard = json.loads((ROOT / "monitoring/grafana/dashboards/benchmark.json").read_text())
+        for panel in dashboard["panels"]:
+            for target in panel.get("targets", []):
+                expression = target["expr"].replace("$mode", "direct")
+                expression = expression.replace("$phase", "measure")
+                expression = expression.replace("$scenario", "htap").replace("$level", "16")
+                status, response = E.call("/api/v1/query?" + urllib.parse.urlencode({
+                    "query": expression}), base=prometheus)
+                self.assertEqual(status, 200, (expression, response))
+                self.assertEqual(response.get("status"), "success", (expression, response))
 
     def test_15_ha_failover_bounded_sql_recovery(self):
         E.run([SCRIPT / "failover.sh", "--run-id", "it-failover", "--rps", "10",
@@ -785,6 +814,26 @@ class Integration(unittest.TestCase):
                                         text=True, timeout=15)
                 E.commands.write("$ " + " ".join(command) + "\n" + result.stderr)
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+
+    def test_22_htap_entrypoint_verifies_segregation_and_keeps_both_results(self):
+        E.run([SCRIPT / "htap.sh", "--mode", "both", "--rps", "2",
+               "--warmup", "0", "--duration", "5", "--max-in-flight", "32",
+               "--request-timeout", "15", "--run-id", "it-htap"], timeout=300)
+        results = [json.loads(path.read_text())
+                   for path in sorted(E.output.glob("it-htap-*.json"))]
+        self.assertEqual([(item["mode"], item["rps"]) for item in results],
+                         [("direct", 2), ("ojp", 2)])
+        for item in results:
+            self.assertNotIn("error", item, item)
+            self.assertEqual(item["scenario"], "htap")
+            self.assertEqual(item["measure"]["counts"]["sql_completed"], 10)
+            self.assertTrue(item.get("benchmark_result_published"), item)
+        classification = results[1]["slow_query_classification"]
+        self.assertIn(classification["observed"], (True, False, None))
+        if classification["observed"] is False:
+            self.assertIn("not demonstrated", classification["message"])
+        if classification["observed"] is None:
+            self.assertIn("could not be verified", classification["message"])
 
 
 def main():

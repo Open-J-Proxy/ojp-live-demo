@@ -97,6 +97,7 @@ services:
     environment:
       RESULTS_DIR: /results
       ADMIN_TOKEN: ${ADMIN_TOKEN:-}
+      OJP_SLOW_QUERY_SEGREGATION_VERIFIED: ${OJP_SLOW_QUERY_SEGREGATION_VERIFIED:-false}
     profiles: ["tools"]
     volumes:
       - ${RESULTS_DIR:-./results}:/results
