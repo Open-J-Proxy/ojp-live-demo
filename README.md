@@ -46,6 +46,8 @@ starts retain the existing data.
 Open [http://localhost:3000/d/ojp-benchmark](http://localhost:3000/d/ojp-benchmark)
 and log in with **admin / demo-local-only**. The dashboard defaults to the
 measurement phase; choose `warmup` from the phase selector to inspect warm-up.
+See [Grafana metrics reference](docs/TECHNICAL.md#grafana-metrics-reference)
+for what each panel shows and where its data comes from.
 
 ## Run the HTAP benchmark
 
