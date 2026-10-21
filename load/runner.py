@@ -94,21 +94,24 @@ def operation_mix(value):
 def parser():
     result = argparse.ArgumentParser(
         description=__doc__,
-        epilog="Each mode/rate resets, warms up, drains, resets, then measures. "
+        epilog="Default profile: --mode both --rps 8,256,8,8 --warmup 10 --duration 30 "
+               "--oltp-percent 98 --olap-percent 2. Each mode/rate resets, warms up, "
+               "drains, resets, then measures. "
                "Arrivals never wait for capacity: excess work is recorded as dropped. "
                "HTTP 202 is not SQL completion. Optional ADMIN_TOKEN authenticates control POSTs. "
                "Docker build context is the repository root.")
     result.add_argument("--url", default="http://app:8080", help="application base URL")
-    result.add_argument("--mode", choices=("direct", "ojp", "both"), default="both")
-    result.add_argument("--rps", type=rates, default=rates("16,32,64"),
+    result.add_argument("--mode", choices=("direct", "ojp", "both"), default="both",
+                        help="connection path to test (default: both, sequentially)")
+    result.add_argument("--rps", type=rates, default=rates("8,256,8,8"),
                         help="ordered integer CSV rates, max 10000/64 distinct levels "
-                             "(default: 16,32,64)")
+                             "(default: 8,256,8,8; baseline, spike, two post-spike windows)")
     result.add_argument("--warmup", type=nonnegative_float, default=10,
                         help="warmup arrival seconds; fully drained (default: 10)")
     result.add_argument("--warmup-only", action="store_true",
                         help="reset, check readiness, warm up and drain; never measure")
-    result.add_argument("--duration", type=positive_float, default=10,
-                        help="measurement arrival seconds, excluding drain (default: 10)")
+    result.add_argument("--duration", type=positive_float, default=30,
+                        help="measurement arrival seconds, excluding drain (default: 30)")
     result.add_argument("--max-in-flight", type=positive_int, default=512,
                         help="maximum outstanding requests AND worker threads (default: 512)")
     result.add_argument("--request-timeout", type=positive_float, default=30,
@@ -124,10 +127,10 @@ def parser():
                         choices=("htap", "failover", "integration"))
     result.add_argument("--ojp-metrics-url", default="http://ojp:9159/metrics",
                         help="OJP Prometheus endpoint used to verify real slow-query classification")
-    result.add_argument("--oltp-percent", type=percentage, default=90,
-                        help="integer OLTP share; rescales 30:25:20:10:5 (default: 90)")
-    result.add_argument("--olap-percent", type=percentage, default=10,
-                        help="integer report share; total shares must be 100 (default: 10)")
+    result.add_argument("--oltp-percent", type=percentage, default=98,
+                        help="integer OLTP share; rescales 30:25:20:10:5 (default: 98)")
+    result.add_argument("--olap-percent", type=percentage, default=2,
+                        help="integer report share; total shares must be 100 (default: 2)")
     result.add_argument("--operation-mix", type=operation_mix,
                         help="optional exact integer percentages, all six keys required: "
                              "browse=30,history=25,checkout=20,review=10,account=5,report=10; "

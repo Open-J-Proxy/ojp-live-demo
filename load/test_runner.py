@@ -59,12 +59,18 @@ class RunnerTests(unittest.TestCase):
                                  "--oltp-percent", "80", "--olap-percent", "20"])
         self.assertEqual(args.rps, [30, 10, 30])
         defaults = runner.arguments([])
-        self.assertEqual(defaults.rps, [16, 32, 64])
+        self.assertEqual(defaults.rps, [8, 256, 8, 8])
         self.assertEqual((defaults.warmup, defaults.duration, defaults.max_in_flight,
-                          defaults.seed), (10, 10, 512, 12345))
+                          defaults.seed), (10, 30, 512, 12345))
         self.assertEqual(defaults.mode, "both")
-        self.assertEqual((defaults.oltp_percent, defaults.olap_percent), (90, 10))
+        self.assertEqual((defaults.oltp_percent, defaults.olap_percent), (98, 2))
         self.assertEqual(defaults.scenario, "htap")
+        profile_weights = runner.operation_weights(
+            defaults.oltp_percent, defaults.olap_percent)
+        profile_size = sum(profile_weights.values())
+        self.assertEqual(profile_weights["report"] / profile_size, .02)
+        self.assertEqual(sum(value for op, value in profile_weights.items()
+                             if op != "report") / profile_size, .98)
         custom = runner.arguments(["--rps", "5,11", "--warmup", "3", "--duration", "7",
                                    "--request-timeout", "9", "--control-timeout", "42",
                                    "--max-in-flight", "23"])
@@ -88,14 +94,22 @@ class RunnerTests(unittest.TestCase):
     def test_htap_entrypoint_enforces_segregation_and_removes_old_benchmarks(self):
         root = Path(__file__).resolve().parent.parent
         script = (root / "scripts" / "htap.sh").read_text()
+        readme = (root / "README.md").read_text()
         self.assertIn("export SLOW_QUERY_ENABLED=true", script)
         self.assertIn("export OJP_SLOW_QUERY_SEGREGATION_VERIFIED=true", script)
         self.assertIn("-Dojp.server.slowQuerySegregation.enabled=true", script)
         self.assertIn("-Dojp.server.slowQuerySegregation.slowSlotPercentage=20", script)
+        self.assertIn("--mode both --rps 8,256,8,8 --warmup 10 --duration 30", script)
+        self.assertIn("--oltp-percent 98 --olap-percent 2", script)
         self.assertIn("run_load htap", script)
+        self.assertIn("```mermaid", readme)
+        for component in ("Docker Compose", "PostgreSQL", "OJP server", "Prometheus",
+                          "Grafana", "postgres-exporter", "Host resource sampler",
+                          "Python open-loop load runner"):
+            self.assertIn(component, readme)
         for old in ("death-spiral.sh", "slow-queries.sh", "throttling.sh", "compare.sh"):
             self.assertFalse((root / "scripts" / old).exists())
-            self.assertNotIn(old, (root / "README.md").read_text())
+            self.assertNotIn(old, readme)
 
     def test_ojp_slow_query_counter_reports_observed_statement_deltas(self):
         body = ('ojp_sql_slow_executions_total{sql_statement="select report"} 4\n'

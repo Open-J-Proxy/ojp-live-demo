@@ -21,9 +21,13 @@ timeouts.
 
 The workload executes ShopService-style SQL: product browse, order history,
 checkout, review writes, account lookup, and aggregate report queries. The
-default exact-ratio schedule is 90% OLTP and 10% OLAP. Warm-up is drained and
-reset before measurement; Direct JDBC and OJP execute sequentially with the
-same seed, reset baseline, request plan, and RPS levels.
+default exact-ratio schedule is 98% OLTP and 2% OLAP. The ordered RPS profile is
+`8,256,8,8`: a baseline, a sharp traffic spike, and two baseline windows to
+observe how each mode behaves after offered load drops. This is an ordered
+sequence of independent rate-level trials, not a single uninterrupted traffic
+trace. Before every measured level, outstanding work drains, the data baseline
+resets, and a separate warm-up runs. Direct JDBC and OJP execute sequentially
+with the same seed, reset baseline, request plan, and RPS levels.
 
 `scripts/htap.sh` recreates the OJP service with segregation enabled,
 `slowSlotPercentage=20`, absolute-threshold classification, and a configurable

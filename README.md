@@ -25,11 +25,12 @@ independent application instances and does not reproduce every aspect of
 distributed scaling. The comparison deliberately uses 200 versus 40 connections;
 it is not an equal-sized pool benchmark and does not assume OJP is faster.
 
-The workload mixes 90% transactional OLTP operations with 10% analytical report
-queries. Slow analytical queries can interfere with transactional traffic. OJP
-slow-query segregation reserves 20% of admission capacity for classified slow
-queries to help protect the fast lane. The benchmark verifies runtime
-configuration and reports whether slow SQL classification was actually observed.
+The default workload is 98% transactional OLTP operations and 2% analytical
+report queries. Slow analytical queries can interfere with transactional
+traffic. OJP slow-query segregation reserves 20% of admission capacity for
+classified slow queries to help protect the fast lane. The benchmark verifies
+runtime configuration and reports whether slow SQL classification was actually
+observed.
 
 ## Start the demo
 
@@ -58,23 +59,66 @@ This is equivalent to:
 
 ```bash
 bash scripts/htap.sh --mode both \
-  --rps 16,32,64 \
-  --warmup 10 --duration 10
+  --rps 8,256,8,8 \
+  --warmup 10 --duration 30 \
+  --oltp-percent 98 --olap-percent 2
 ```
 
-The benchmark offers 16, then 32, then 64 requests per second. Each level gets a
-10-second warm-up, followed by a separate 10-second measurement. Direct JDBC and
-OJP run sequentially, never at the same time. The script requires OJP
-slow-query segregation to be enabled with a 20% slow lane. It records actual
-classification when available; if none is seen, the result says that isolation
-was not demonstrated.
+The default profile starts at 8 requests/second, jumps to 256, then returns to
+8 twice. The sharp jump simulates a sudden traffic spike; the post-spike windows
+show observed behavior as load returns to baseline. Each rate level is measured
+independently: the benchmark drains work, resets the database baseline, and
+warms up before its 30-second measurement. Thus, the ordered profile compares
+the spike and low-load windows consistently; it is not one uninterrupted
+stateful run. Every interval has a 10-second warm-up. Direct JDBC and OJP run
+sequentially, never at the same time. The 98/2 mix keeps OLTP representative
+while still exercising real analytical queries. OJP segregation is mandatory,
+with a 20% slow lane. If no slow SQL classification is observed, the result
+states that isolation was not demonstrated.
 
 Options include `--mode direct|ojp|both`, `--rps` with an ordered comma-separated
 sequence, `--warmup`, `--duration`, `--request-timeout` for measured requests,
 `--control-timeout` for mode switches and controls, `--max-in-flight`, `--seed`,
-`--oltp-percent`/`--olap-percent`, and `--operation-mix`. Defaults retain the
-90% OLTP / 10% OLAP workload. Use `--help` for the full list. Results are written
-as JSON and CSV under `results/`.
+`--oltp-percent`/`--olap-percent`, and `--operation-mix`. Defaults are 98% OLTP
+/ 2% OLAP; override them for a different workload mix. Use `--help` for the full
+list. Results are written as JSON and CSV under `results/`.
+
+## How the components fit together
+
+```mermaid
+flowchart LR
+    Operator["Operator"] --> Start["scripts/start.sh"]
+    Operator --> HTAP["scripts/htap.sh"]
+    Start --> Compose["Docker Compose"]
+    Compose --> PG[("PostgreSQL<br/>shop database")]
+    Compose --> App["Java ShopService demo<br/>HTTP workers + admin API"]
+    Compose --> OJP["OJP server<br/>slow-query segregation<br/>20% slow lane"]
+    Compose --> Exporter["postgres-exporter"]
+    Compose --> Prom["Prometheus"]
+    Compose --> Grafana["Grafana<br/>HTAP + diagnostics dashboards"]
+    Seed["scripts/seed-data.sh"] --> PG
+    HTAP --> Load["Python open-loop load runner"]
+    Load -->|"work requests :8080"| App
+    Load -->|"mode / reset / context / arrivals :8081"| App
+    App -->|"Direct JDBC<br/>HikariCP min=max 200"| PG
+    App -->|"OJP JDBC logical connection<br/>create/close per transaction"| OJP
+    OJP -->|"backend pool max 40"| PG
+    PG --> Exporter
+    App -->|"application metrics :8081"| Prom
+    OJP -->|"pool + SQL metrics :9159"| Prom
+    Exporter --> Prom
+    Docker["Docker Engine"] -->|"container stats"| Sampler["Host resource sampler"]
+    Sampler -->|"CPU/memory snapshots"| App
+    Sampler --> Results["JSONL resource evidence"]
+    Load --> Results2["Per-mode / per-RPS JSON and CSV"]
+    Results --> Results2
+    Prom --> Grafana
+```
+
+Direct JDBC and OJP are exercised sequentially by the same runner. The app
+exports labeled application metrics; Prometheus also scrapes OJP and PostgreSQL
+exporter telemetry. The host-side resource sampler publishes PostgreSQL CPU and
+memory snapshots and retains the raw evidence alongside benchmark results.
 
 ## Understand the results
 

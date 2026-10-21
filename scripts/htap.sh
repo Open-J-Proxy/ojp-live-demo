@@ -6,7 +6,11 @@ if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
   cat <<'EOF'
 Usage: scripts/htap.sh [load-runner options]
 Runs the sequential Direct JDBC/HikariCP versus OJP HTAP comparison.
-Defaults: --mode both --rps 16,32,64 --warmup 10 --duration 10
+Defaults: --mode both --rps 8,256,8,8 --warmup 10 --duration 30
+          --oltp-percent 98 --olap-percent 2
+The rate profile applies low traffic, a sharp spike, then two low-load windows
+for post-spike observations. Each rate level has its own baseline reset,
+warm-up, and measurement interval.
 OJP slow-query segregation is mandatory with a 20% slow lane.
 EOF
   exit 0
