@@ -308,7 +308,7 @@ public final class Main implements AutoCloseable {
                         java -jar demo.jar [--help|--version|--validate-config]
                         Env: PG_URL PG_USER PG_PASSWORD PG_ADMIN_URL PG_ADMIN_USER PG_ADMIN_PASSWORD
                              OJP_URL MODE=direct|ojp DIRECT_POOL_SIZE=200 HTTP_WORKERS=512
-                             OJP_POOL_SIZE=40 OJP_MIN_IDLE=10
+                             OJP_POOL_SIZE=10 OJP_MIN_IDLE=10
                              PORT=8080 ADMIN_PORT=8081 HTTP_QUEUE_SIZE=1024 STARTUP_TIMEOUT_SECONDS=180
                              SQL_TIMEOUT_SECONDS=30 BIND_ADDRESS=0.0.0.0 TEST_ENDPOINTS=false ADMIN_TOKEN
                         Admin mutations are demo-only: protect both ports; set ADMIN_TOKEN outside local demos.

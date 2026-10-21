@@ -12,17 +12,17 @@ PostgreSQL connections:
 
 Traditional client-side pools can consume many database connections. Open J Proxy
 (OJP) centralizes pooling: applications create logical JDBC connections while
-OJP reuses a 40-connection PostgreSQL backend pool.
+OJP reuses a 10-connection PostgreSQL backend pool.
 
 ```text
 Direct JDBC: 10 × 20 client connections → PostgreSQL (200)
-OJP:         10 instances → logical connections → OJP → PostgreSQL (40)
+OJP:         10 instances → logical connections → OJP → PostgreSQL (10)
 ```
 
 This demo uses one application process with a 200-connection HikariCP pool to
 emulate the aggregate connection footprint of ten services. It is not ten
 independent application instances and does not reproduce every aspect of
-distributed scaling. The comparison deliberately uses 200 versus 40 connections;
+distributed scaling. The comparison deliberately uses 200 versus 10 connections;
 it is not an equal-sized pool benchmark and does not assume OJP is faster.
 
 The default workload is 98% transactional OLTP operations and 2% analytical
@@ -105,7 +105,7 @@ flowchart LR
     Load -->|"mode / reset / context / arrivals :8081"| App
     App -->|"Direct JDBC<br/>HikariCP min=max 200"| PG
     App -->|"OJP JDBC logical connection<br/>create/close per transaction"| OJP
-    OJP -->|"backend pool max 40"| PG
+    OJP -->|"backend pool min=max 10"| PG
     PG --> Exporter
     App -->|"application metrics :8081"| Prom
     OJP -->|"pool + SQL metrics :9159"| Prom

@@ -66,7 +66,7 @@ services:
       PG_PASSWORD: ${DB_PASSWORD:-demo-local-only}
       OJP_URL: ${OJP_URL:-jdbc:ojp[ojp:1059]_postgresql://postgres:5432/shop?ApplicationName=demo-ojp}
       DIRECT_POOL_SIZE: ${DIRECT_POOL_SIZE:-200}
-      OJP_POOL_SIZE: ${OJP_POOL_SIZE:-40}
+      OJP_POOL_SIZE: ${OJP_POOL_SIZE:-10}
       OJP_MIN_IDLE: ${OJP_MIN_IDLE:-10}
       HTTP_WORKERS: ${HTTP_WORKERS:-512}
       HTTP_QUEUE_SIZE: ${HTTP_QUEUE_SIZE:-1024}

@@ -5,7 +5,7 @@
 The Direct JDBC path uses HikariCP with `minimumIdle=200` and
 `maximumPoolSize=200`. The OJP application path has no local HikariCP pool:
 each transaction opens and closes a logical JDBC connection, while OJP's
-backend pool has a maximum of 40 and minimum idle of 10. HTTP capacity remains
+backend pool has a minimum idle and maximum of 10. HTTP capacity remains
 512 workers by default. These sizes are intentionally asymmetric.
 
 PostgreSQL sessions from the Direct pool use a per-process, unique
@@ -74,7 +74,7 @@ query was classified. The benchmark records the absence or increase explicitly.
 | Variable | Default | Purpose |
 |---|---:|---|
 | `DIRECT_POOL_SIZE` | 200 | Direct HikariCP minimum and maximum |
-| `OJP_POOL_SIZE` | 40 | OJP backend pool maximum |
+| `OJP_POOL_SIZE` | 10 | OJP backend pool maximum |
 | `OJP_MIN_IDLE` | 10 | OJP backend idle target |
 | `HTTP_WORKERS` | 512 | Bounded application workers (minimum 200) |
 | `HTTP_QUEUE_SIZE` | 1024 | Bounded HTTP queue |

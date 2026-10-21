@@ -22,7 +22,7 @@ record Config(String pgUrl, String pgUser, String pgPassword, String ojpUrl, Str
         int port = number(env, "PORT", 8080, 1, 65535);
         int admin = number(env, "ADMIN_PORT", 8081, 1, 65535);
         if (port == admin) throw new IllegalArgumentException("PORT and ADMIN_PORT must differ");
-        int ojpPoolSize = number(env, "OJP_POOL_SIZE", 40, 1, 2000);
+        int ojpPoolSize = number(env, "OJP_POOL_SIZE", 10, 1, 2000);
         int ojpMinIdle = number(env, "OJP_MIN_IDLE", 10, 0, 2000);
         if (ojpMinIdle > ojpPoolSize) throw new IllegalArgumentException("OJP_MIN_IDLE must not exceed OJP_POOL_SIZE");
         return new Config(pg, env.getOrDefault("PG_USER", "demo"), env.getOrDefault("PG_PASSWORD", "demo"),
