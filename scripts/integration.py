@@ -478,7 +478,7 @@ class Integration(unittest.TestCase):
 
     def test_11_ordered_sequential_comparison_and_metadata(self):
         results = E.runner("it-compare", "--mode", "both", "--rps", "3,7",
-                           "--warmup", "1", "--duration", "2", "--seed", "4242",
+                           "--warmup", "1", "--duration", "5", "--seed", "4242",
                            "--max-in-flight", "17", "--request-timeout", "45")
         self.assertEqual([(item["mode"], item["rps"]) for item in results],
                          [("direct", 3), ("direct", 7), ("ojp", 3), ("ojp", 7)])
@@ -496,7 +496,7 @@ class Integration(unittest.TestCase):
             self.assertEqual(item["metrics_before_measure"]["status"], 200)
             self.assertEqual(item["metrics_after"]["status"], 200)
             self.assertTrue(item.get("benchmark_result_published"), item)
-            for phase, duration in (("warmup", 1), ("measure", 2)):
+            for phase, duration in (("warmup", 1), ("measure", 5)):
                 report = item[phase]
                 self.assertLessEqual(report["start_epoch_seconds"], report["end_arrivals_epoch_seconds"])
                 self.assertLessEqual(report["end_arrivals_epoch_seconds"], report["end_epoch_seconds"])
@@ -817,7 +817,7 @@ class Integration(unittest.TestCase):
 
     def test_22_htap_entrypoint_verifies_segregation_and_keeps_both_results(self):
         E.run([SCRIPT / "htap.sh", "--mode", "both", "--rps", "2",
-               "--warmup", "0", "--duration", "4", "--max-in-flight", "32",
+               "--warmup", "0", "--duration", "5", "--max-in-flight", "32",
                "--request-timeout", "15", "--run-id", "it-htap"], timeout=300)
         results = [json.loads(path.read_text())
                    for path in sorted(E.output.glob("it-htap-*.json"))]
@@ -826,7 +826,7 @@ class Integration(unittest.TestCase):
         for item in results:
             self.assertNotIn("error", item, item)
             self.assertEqual(item["scenario"], "htap")
-            self.assertEqual(item["measure"]["counts"]["sql_completed"], 8)
+            self.assertEqual(item["measure"]["counts"]["sql_completed"], 10)
             self.assertTrue(item.get("benchmark_result_published"), item)
         classification = results[1]["slow_query_classification"]
         self.assertIn(classification["observed"], (True, False, None))
