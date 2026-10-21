@@ -57,11 +57,11 @@ PostgreSQL CPU. This allows sequential Direct/OJP results to appear side by
 side without pretending their database gauges were sampled simultaneously.
 Run IDs remain in JSON/CSV result artifacts, not Prometheus labels.
 
-The main Grafana dashboard focuses on load, latency, errors/drops, physical and
-logical connections, PostgreSQL CPU, OJP pool utilization, and a Direct/OJP
-measurement table. The diagnostics dashboard separates PostgreSQL connections,
-transactions per second, and tuples returned per second because they have
-different units and scales. Grafana provisioning is in
+The Grafana dashboard shows offered/dispatched/completed RPS, server and
+end-to-end latency, OLTP versus OLAP P95, errors/rollbacks/drops, PostgreSQL
+connections and transaction activity, Direct HikariCP and OJP backend pool
+gauges, logical connections, OJP SQL classifications, and PostgreSQL CPU and
+memory. Grafana provisioning is in
 `monitoring/grafana/provisioning/`.
 
 OJP's scrape endpoint also exports live pool gauges and actual SQL execution /

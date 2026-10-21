@@ -44,10 +44,8 @@ starts retain the existing data.
 ## Open Grafana
 
 Open [http://localhost:3000/d/ojp-benchmark](http://localhost:3000/d/ojp-benchmark)
-and log in with **admin / demo-local-only**. The main dashboard defaults to the
+and log in with **admin / demo-local-only**. The dashboard defaults to the
 measurement phase; choose `warmup` from the phase selector to inspect warm-up.
-The diagnostics dashboard contains separate PostgreSQL connection, transaction
-rate, and tuple-rate graphs.
 
 ## Run the HTAP benchmark
 
@@ -100,7 +98,7 @@ flowchart LR
     Compose --> OJP["OJP server<br/>slow-query segregation<br/>20% slow lane"]
     Compose --> Exporter["postgres-exporter"]
     Compose --> Prom["Prometheus"]
-    Compose --> Grafana["Grafana<br/>HTAP + diagnostics dashboards"]
+    Compose --> Grafana["Grafana<br/>benchmark dashboard"]
     Seed["scripts/seed-data.sh"] --> PG
     HTAP --> Load["Python open-loop load runner"]
     Load -->|"work requests :8080"| App
