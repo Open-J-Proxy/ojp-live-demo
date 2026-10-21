@@ -1,67 +1,55 @@
 {
-  "uid": "ojp-benchmark",
-  "title": "Open J Proxy — HTAP Benchmark",
-  "schemaVersion": 39,
-  "version": 2,
-  "refresh": "5s",
-  "timezone": "utc",
-  "time": {"from": "now-30m", "to": "now"},
-  "templating": {"list": [
-    {"name": "mode", "type": "custom", "query": "direct,ojp", "includeAll": true, "allValue": ".*", "current": {"text": "All", "value": "$__all"}},
-    {"name": "phase", "type": "custom", "query": "measure,warmup", "current": {"text": "measure", "value": "measure"}},
-    {"name": "scenario", "type": "query", "datasource": {"uid": "prometheus", "type": "prometheus"}, "query": "label_values(demo_load_completed_total, scenario)", "includeAll": true, "allValue": ".*", "current": {"text": "htap", "value": "htap"}},
-    {"name": "level", "type": "query", "datasource": {"uid": "prometheus", "type": "prometheus"}, "query": "label_values(demo_load_completed_total, level)", "includeAll": true, "allValue": ".*", "current": {"text": "All", "value": "$__all"}}
+  "uid":"ojp-benchmark","title":"Open J Proxy — Live JDBC Benchmark","schemaVersion":39,"version":1,"refresh":"5s","timezone":"utc",
+  "time":{"from":"now-15m","to":"now"},
+  "templating":{"list":[
+    {"name":"mode","type":"query","datasource":{"uid":"prometheus","type":"prometheus"},"query":"label_values(demo_completions_total, mode)","includeAll":true,"multi":true,"allValue":".*","current":{"text":"All","value":"$__all"}},
+    {"name":"phase","type":"custom","query":"measure,warmup","current":{"text":"measure","value":"measure"}},
+    {"name":"scenario","type":"query","datasource":{"uid":"prometheus","type":"prometheus"},"query":"label_values(demo_completions_total, scenario)","includeAll":true,"multi":true,"allValue":".*","current":{"text":"All","value":"$__all"}},
+    {"name":"level","type":"query","datasource":{"uid":"prometheus","type":"prometheus"},"query":"label_values(demo_completions_total, level)","includeAll":true,"multi":true,"allValue":".*","current":{"text":"All","value":"$__all"}}
   ]},
-  "panels": [
-    {"id": 1, "type": "text", "title": "Benchmark methodology", "gridPos": {"x": 0, "y": 0, "w": 24, "h": 3}, "options": {"mode": "markdown", "content": "Direct JDBC uses a 200-connection HikariCP pool; OJP creates logical connections without a local pool and uses a 40-connection backend pool. These represent different connection-management architectures, not equal-sized pools. Modes run sequentially. Warm-up is separate; select `phase=measure` for the comparison. The comparison table uses saved per-mode/per-RPS measurement summaries, not gauges sampled at a shared wall-clock time. `run_id` is kept in result files, never in Prometheus labels."}},
-    {"id": 2, "type": "timeseries", "title": "Offered RPS vs successful throughput", "datasource": {"uid": "prometheus", "type": "prometheus"}, "gridPos": {"x": 0, "y": 3, "w": 12, "h": 7}, "targets": [
-      {"expr": "sum by(mode,level)(rate(demo_load_scheduled_total{mode=~\"$mode\",phase=\"$phase\",scenario=~\"$scenario\",level=~\"$level\"}[30s]))", "legendFormat": "{{mode}} offered"},
-      {"expr": "sum by(mode,level)(rate(demo_load_completed_total{mode=~\"$mode\",phase=\"$phase\",scenario=~\"$scenario\",level=~\"$level\"}[30s]))", "legendFormat": "{{mode}} successful"}
-    ]},
-    {"id": 3, "type": "timeseries", "title": "End-to-end P95 / P99 latency", "datasource": {"uid": "prometheus", "type": "prometheus"}, "gridPos": {"x": 12, "y": 3, "w": 12, "h": 7}, "fieldConfig": {"defaults": {"unit": "s"}}, "targets": [
-      {"expr": "histogram_quantile(0.95,sum by(le,mode,level)(rate(demo_load_latency_seconds_bucket{mode=~\"$mode\",phase=\"$phase\",scenario=~\"$scenario\",level=~\"$level\"}[30s])))", "legendFormat": "{{mode}} P95"},
-      {"expr": "histogram_quantile(0.99,sum by(le,mode,level)(rate(demo_load_latency_seconds_bucket{mode=~\"$mode\",phase=\"$phase\",scenario=~\"$scenario\",level=~\"$level\"}[30s])))", "legendFormat": "{{mode}} P99"}
-    ]},
-    {"id": 4, "type": "timeseries", "title": "OLTP P95 latency — primary metric", "datasource": {"uid": "prometheus", "type": "prometheus"}, "gridPos": {"x": 0, "y": 10, "w": 12, "h": 7}, "fieldConfig": {"defaults": {"unit": "s"}}, "targets": [
-      {"expr": "histogram_quantile(0.95,sum by(le,mode,level)(rate(demo_request_duration_seconds_bucket{mode=~\"$mode\",phase=\"$phase\",scenario=~\"$scenario\",level=~\"$level\",op!=\"report\",op!=\"hold\",op!=\"rollback\"}[30s])))", "legendFormat": "{{mode}} RPS {{level}}"}
-    ]},
-    {"id": 5, "type": "timeseries", "title": "OLAP P95 latency (report queries)", "datasource": {"uid": "prometheus", "type": "prometheus"}, "gridPos": {"x": 12, "y": 10, "w": 12, "h": 7}, "fieldConfig": {"defaults": {"unit": "s"}}, "targets": [
-      {"expr": "histogram_quantile(0.95,sum by(le,mode,level)(rate(demo_request_duration_seconds_bucket{mode=~\"$mode\",phase=\"$phase\",scenario=~\"$scenario\",level=~\"$level\",op=\"report\"}[30s])))", "legendFormat": "{{mode}} RPS {{level}}"}
-    ]},
-    {"id": 6, "type": "timeseries", "title": "Transaction errors and dropped requests", "datasource": {"uid": "prometheus", "type": "prometheus"}, "gridPos": {"x": 0, "y": 17, "w": 12, "h": 7}, "targets": [
-      {"expr": "sum by(mode,level)(rate(demo_load_errors_total{mode=~\"$mode\",phase=\"$phase\",scenario=~\"$scenario\",level=~\"$level\"}[30s]))", "legendFormat": "{{mode}} errors/s"},
-      {"expr": "sum by(mode,level)(rate(demo_load_dropped_total{mode=~\"$mode\",phase=\"$phase\",scenario=~\"$scenario\",level=~\"$level\"}[30s]))", "legendFormat": "{{mode}} dropped/s"}
-    ]},
-    {"id": 7, "type": "timeseries", "title": "Physical PostgreSQL connections by measured mode", "description": "Saved at the end of each mode's measurement; not compared at a shared wall-clock time.", "datasource": {"uid": "prometheus", "type": "prometheus"}, "gridPos": {"x": 12, "y": 17, "w": 12, "h": 7}, "targets": [
-      {"expr": "demo_benchmark_result_physical_connections{phase=\"measure\",scenario=~\"$scenario\",level=~\"$level\",mode=~\"$mode\"}", "legendFormat": "{{mode}} RPS {{level}}"}
-    ]},
-    {"id": 8, "type": "timeseries", "title": "Logical JDBC connections created / closed by mode", "datasource": {"uid": "prometheus", "type": "prometheus"}, "gridPos": {"x": 0, "y": 24, "w": 12, "h": 7}, "targets": [
-      {"expr": "sum by(mode)(rate(demo_logical_connections_opened_total{mode=~\"$mode\"}[30s]))", "legendFormat": "{{mode}} created/s"},
-      {"expr": "sum by(mode)(rate(demo_logical_connections_closed_total{mode=~\"$mode\"}[30s]))", "legendFormat": "{{mode}} closed/s"}
-    ]},
-    {"id": 9, "type": "timeseries", "title": "PostgreSQL CPU during each mode's measurement", "description": "Saved per-mode results avoid comparing sequential workloads at one timestamp. CPU percentage is container CPU (100% equals one core).", "datasource": {"uid": "prometheus", "type": "prometheus"}, "gridPos": {"x": 12, "y": 24, "w": 12, "h": 7}, "fieldConfig": {"defaults": {"unit": "percent", "min": 0}}, "targets": [
-      {"expr": "demo_benchmark_result_postgres_cpu_percent{phase=\"measure\",scenario=~\"$scenario\",level=~\"$level\",mode=~\"$mode\"}", "legendFormat": "{{mode}} RPS {{level}}"}
-    ]},
-    {"id": 10, "type": "timeseries", "title": "OJP backend pool utilization", "datasource": {"uid": "prometheus", "type": "prometheus"}, "gridPos": {"x": 0, "y": 31, "w": 12, "h": 7}, "fieldConfig": {"defaults": {"unit": "percent", "min": 0, "max": 100}}, "targets": [
-      {"expr": "100 * ojp_hikari_pool_connections_active_connections / ojp_hikari_pool_connections_max_connections", "legendFormat": "{{instance}} active / max"}
-    ]},
-    {"id": 11, "type": "table", "title": "Direct vs OJP — measurement results by RPS", "description": "Each pair is saved independently for its own measurement window. CPU and physical connections are not wall-clock-aligned gauges.", "datasource": {"uid": "prometheus", "type": "prometheus"}, "gridPos": {"x": 12, "y": 31, "w": 12, "h": 14}, "targets": [
-      {"expr": "demo_benchmark_result_successful_rps{mode=\"direct\",phase=\"measure\",scenario=~\"$scenario\",level=~\"$level\"}", "legendFormat": "Direct successful RPS", "instant": true, "format": "table"},
-      {"expr": "demo_benchmark_result_successful_rps{mode=\"ojp\",phase=\"measure\",scenario=~\"$scenario\",level=~\"$level\"}", "legendFormat": "OJP successful RPS", "instant": true, "format": "table"},
-      {"expr": "demo_benchmark_result_oltp_p95_milliseconds{mode=\"direct\",phase=\"measure\",scenario=~\"$scenario\",level=~\"$level\"}", "legendFormat": "Direct OLTP P95 ms", "instant": true, "format": "table"},
-      {"expr": "demo_benchmark_result_oltp_p95_milliseconds{mode=\"ojp\",phase=\"measure\",scenario=~\"$scenario\",level=~\"$level\"}", "legendFormat": "OJP OLTP P95 ms", "instant": true, "format": "table"},
-      {"expr": "demo_benchmark_result_olap_p95_milliseconds{mode=\"direct\",phase=\"measure\",scenario=~\"$scenario\",level=~\"$level\"}", "legendFormat": "Direct OLAP P95 ms", "instant": true, "format": "table"},
-      {"expr": "demo_benchmark_result_olap_p95_milliseconds{mode=\"ojp\",phase=\"measure\",scenario=~\"$scenario\",level=~\"$level\"}", "legendFormat": "OJP OLAP P95 ms", "instant": true, "format": "table"},
-      {"expr": "demo_benchmark_result_error_percent{mode=\"direct\",phase=\"measure\",scenario=~\"$scenario\",level=~\"$level\"}", "legendFormat": "Direct error %", "instant": true, "format": "table"},
-      {"expr": "demo_benchmark_result_error_percent{mode=\"ojp\",phase=\"measure\",scenario=~\"$scenario\",level=~\"$level\"}", "legendFormat": "OJP error %", "instant": true, "format": "table"},
-      {"expr": "demo_benchmark_result_dropped_requests{mode=\"direct\",phase=\"measure\",scenario=~\"$scenario\",level=~\"$level\"}", "legendFormat": "Direct drops", "instant": true, "format": "table"},
-      {"expr": "demo_benchmark_result_dropped_requests{mode=\"ojp\",phase=\"measure\",scenario=~\"$scenario\",level=~\"$level\"}", "legendFormat": "OJP drops", "instant": true, "format": "table"},
-      {"expr": "demo_benchmark_result_physical_connections{mode=\"direct\",phase=\"measure\",scenario=~\"$scenario\",level=~\"$level\"}", "legendFormat": "Direct PostgreSQL connections", "instant": true, "format": "table"},
-      {"expr": "demo_benchmark_result_physical_connections{mode=\"ojp\",phase=\"measure\",scenario=~\"$scenario\",level=~\"$level\"}", "legendFormat": "OJP PostgreSQL connections", "instant": true, "format": "table"},
-      {"expr": "demo_benchmark_result_postgres_cpu_percent{mode=\"direct\",phase=\"measure\",scenario=~\"$scenario\",level=~\"$level\"}", "legendFormat": "Direct PostgreSQL CPU %", "instant": true, "format": "table"},
-      {"expr": "demo_benchmark_result_postgres_cpu_percent{mode=\"ojp\",phase=\"measure\",scenario=~\"$scenario\",level=~\"$level\"}", "legendFormat": "OJP PostgreSQL CPU %", "instant": true, "format": "table"}
-    ], "transformations": [
-      {"id": "joinByLabels", "options": {"mode": "outer", "by": ["scenario", "level"]}}
-    ]}
+  "panels":[
+    {"id":1,"type":"text","title":"Experiment boundaries","gridPos":{"x":0,"y":0,"w":24,"h":3},"options":{"mode":"markdown","content":"Set the absolute UTC time range to the JSON result's measurement window. Warm-up is excluded by default. Direct 200 versus OJP 10 compares different capacity-management architectures. Both scheduled-arrival and server-only latency histograms are shown. PostgreSQL CPU/memory comes from actual timestamped Docker stats (also saved as JSONL); 100% CPU means one core. Empty slow-classification metrics do not prove isolation."}},
+    {"id":2,"type":"timeseries","title":"Offered / dispatched / SQL-completed RPS","datasource":{"uid":"prometheus","type":"prometheus"},"gridPos":{"x":0,"y":3,"w":12,"h":7},"targets":[
+      {"expr":"sum by(mode)(rate(demo_load_scheduled_total{mode=~\"$mode\",phase=\"$phase\",scenario=~\"$scenario\",level=~\"$level\"}[30s]))","legendFormat":"{{mode}} offered"},
+      {"expr":"sum by(mode)(rate(demo_load_dispatched_total{mode=~\"$mode\",phase=\"$phase\",scenario=~\"$scenario\",level=~\"$level\"}[30s]))","legendFormat":"{{mode}} dispatched"},
+      {"expr":"sum by(mode)(rate(demo_completions_total{mode=~\"$mode\",phase=\"$phase\",scenario=~\"$scenario\",level=~\"$level\",op!=\"hold\",op!=\"rollback\"}[30s]))","legendFormat":"{{mode}} SQL completed"}]},
+    {"id":3,"type":"timeseries","title":"Server P95 / P99 latency","datasource":{"uid":"prometheus","type":"prometheus"},"gridPos":{"x":12,"y":3,"w":12,"h":7},"fieldConfig":{"defaults":{"unit":"s"}},"targets":[
+      {"expr":"histogram_quantile(0.95,sum by(le,mode)(rate(demo_request_duration_seconds_bucket{mode=~\"$mode\",phase=\"$phase\",scenario=~\"$scenario\",level=~\"$level\"}[30s])))","legendFormat":"{{mode}} P95"},
+      {"expr":"histogram_quantile(0.99,sum by(le,mode)(rate(demo_request_duration_seconds_bucket{mode=~\"$mode\",phase=\"$phase\",scenario=~\"$scenario\",level=~\"$level\"}[30s])))","legendFormat":"{{mode}} P99"}]},
+    {"id":4,"type":"timeseries","title":"SQL success / errors / rollback rates","datasource":{"uid":"prometheus","type":"prometheus"},"gridPos":{"x":0,"y":10,"w":12,"h":7},"targets":[
+      {"expr":"sum by(mode)(rate(demo_completions_total{mode=~\"$mode\",phase=\"$phase\",scenario=~\"$scenario\",level=~\"$level\"}[30s]))","legendFormat":"{{mode}} success"},
+      {"expr":"sum by(mode)(rate(demo_errors_total{mode=~\"$mode\",phase=\"$phase\",scenario=~\"$scenario\",level=~\"$level\"}[30s]))","legendFormat":"{{mode}} errors"},
+      {"expr":"sum by(mode)(rate(demo_rollbacks_total{mode=~\"$mode\",phase=\"$phase\",scenario=~\"$scenario\",level=~\"$level\"}[30s]))","legendFormat":"{{mode}} rollbacks"}]},
+    {"id":6,"type":"timeseries","title":"Direct HikariCP physical pool","datasource":{"uid":"prometheus","type":"prometheus"},"gridPos":{"x":0,"y":17,"w":12,"h":7},"targets":[
+      {"expr":"demo_hikari_active","legendFormat":"active"},{"expr":"demo_hikari_idle","legendFormat":"idle"},{"expr":"demo_hikari_total","legendFormat":"total"}]},
+    {"id":7,"type":"timeseries","title":"OJP backend physical pool (live server metrics)","datasource":{"uid":"prometheus","type":"prometheus"},"gridPos":{"x":12,"y":17,"w":12,"h":7},"targets":[
+      {"expr":"ojp_hikari_pool_connections_active_connections","legendFormat":"{{instance}} active"},{"expr":"ojp_hikari_pool_connections_idle_connections","legendFormat":"{{instance}} idle"},{"expr":"ojp_hikari_pool_connections_max_connections","legendFormat":"{{instance}} max"}]},
+    {"id":8,"type":"timeseries","title":"P95 OLTP versus OLAP","datasource":{"uid":"prometheus","type":"prometheus"},"gridPos":{"x":0,"y":24,"w":12,"h":7},"fieldConfig":{"defaults":{"unit":"s"}},"targets":[
+      {"expr":"histogram_quantile(0.95,sum by(le,mode)(rate(demo_request_duration_seconds_bucket{mode=~\"$mode\",phase=\"$phase\",scenario=~\"$scenario\",level=~\"$level\",op!=\"report\",op!=\"hold\",op!=\"rollback\"}[30s])))","legendFormat":"{{mode}} OLTP"},
+      {"expr":"histogram_quantile(0.95,sum by(le,mode)(rate(demo_request_duration_seconds_bucket{mode=~\"$mode\",phase=\"$phase\",scenario=~\"$scenario\",level=~\"$level\",op=\"report\"}[30s])))","legendFormat":"{{mode}} OLAP"}]},
+    {"id":9,"type":"timeseries","title":"HTTP workers / admission queue / requests in flight","datasource":{"uid":"prometheus","type":"prometheus"},"gridPos":{"x":12,"y":24,"w":12,"h":7},"targets":[
+      {"expr":"demo_http_workers_active","legendFormat":"active workers"},{"expr":"demo_http_queue","legendFormat":"queued"},{"expr":"demo_inflight","legendFormat":"in flight"},{"expr":"demo_http_workers","legendFormat":"capacity"},{"expr":"rate(demo_rejected_total[30s])","legendFormat":"rejections/s"}]},
+    {"id":10,"type":"timeseries","title":"P95 connection acquisition","datasource":{"uid":"prometheus","type":"prometheus"},"gridPos":{"x":0,"y":31,"w":12,"h":7},"fieldConfig":{"defaults":{"unit":"s"}},"targets":[
+      {"expr":"histogram_quantile(0.95,sum by(le,mode)(rate(demo_acquisition_duration_seconds_bucket{mode=~\"$mode\",phase=\"$phase\",scenario=~\"$scenario\",level=~\"$level\"}[30s])))","legendFormat":"{{mode}} acquisition"}]},
+    {"id":11,"type":"timeseries","title":"OJP backend pending threads (pool pressure)","datasource":{"uid":"prometheus","type":"prometheus"},"gridPos":{"x":12,"y":31,"w":12,"h":7},"targets":[
+      {"expr":"ojp_hikari_pool_connections_pending_threads","legendFormat":"{{instance}} {{pool_name}} pending"}]},
+    {"id":12,"type":"table","title":"Current mode / scenario / phase / RPS level","datasource":{"uid":"prometheus","type":"prometheus"},"gridPos":{"x":0,"y":38,"w":12,"h":6},"targets":[{"expr":"demo_context","instant":true,"format":"table"}]},
+    {"id":13,"type":"timeseries","title":"OJP logical connections opened / closed","datasource":{"uid":"prometheus","type":"prometheus"},"gridPos":{"x":12,"y":38,"w":12,"h":6},"targets":[
+      {"expr":"demo_logical_connections_opened_total","legendFormat":"{{mode}} opened"},{"expr":"demo_logical_connections_closed_total","legendFormat":"{{mode}} closed"}]},
+    {"id":14,"type":"timeseries","title":"Actual OJP SQL classifications (not admission rejections)","datasource":{"uid":"prometheus","type":"prometheus"},"gridPos":{"x":0,"y":44,"w":24,"h":7},"targets":[
+      {"expr":"sum by(instance)(rate(ojp_sql_executions_total[30s]))","legendFormat":"{{instance}} all SQL/s"},
+      {"expr":"sum by(instance)(rate(ojp_sql_slow_executions_total[30s]))","legendFormat":"{{instance}} classified slow/s"}]},
+    {"id":15,"type":"text","title":"OJP 1.0.3 telemetry limits","gridPos":{"x":0,"y":51,"w":24,"h":3},"options":{"mode":"markdown","content":"This release does not export dedicated admission/rejection, fast/slow-lane, or JDBC throttle counters. Pending backend threads show pool pressure, not rejection counts. SQL slow counters appear only after actual slow classification. Use client drop/error counts and recorded OJP logs; do not substitute synthetic OJP metrics."}},
+    {"id":16,"type":"timeseries","title":"Scheduled-arrival to completion P95 / P99 (includes client and server queues)","datasource":{"uid":"prometheus","type":"prometheus"},"gridPos":{"x":0,"y":54,"w":12,"h":7},"fieldConfig":{"defaults":{"unit":"s"}},"targets":[
+      {"expr":"histogram_quantile(0.95,sum by(le,mode)(rate(demo_load_latency_seconds_bucket{mode=~\"$mode\",phase=\"$phase\",scenario=~\"$scenario\",level=~\"$level\"}[30s])))","legendFormat":"{{mode}} end-to-end P95"},
+      {"expr":"histogram_quantile(0.99,sum by(le,mode)(rate(demo_load_latency_seconds_bucket{mode=~\"$mode\",phase=\"$phase\",scenario=~\"$scenario\",level=~\"$level\"}[30s])))","legendFormat":"{{mode}} end-to-end P99"}]},
+    {"id":17,"type":"timeseries","title":"Generator drops / timeouts / requests in flight","datasource":{"uid":"prometheus","type":"prometheus"},"gridPos":{"x":12,"y":54,"w":12,"h":7},"targets":[
+      {"expr":"sum by(mode)(rate(demo_load_dropped_total{mode=~\"$mode\",phase=\"$phase\",scenario=~\"$scenario\",level=~\"$level\"}[30s]))","legendFormat":"{{mode}} dropped/s"},
+      {"expr":"sum by(mode)(rate(demo_load_timeouts_total{mode=~\"$mode\",phase=\"$phase\",scenario=~\"$scenario\",level=~\"$level\"}[30s]))","legendFormat":"{{mode}} timed out/s"},
+      {"expr":"sum by(mode)(demo_load_inflight{mode=~\"$mode\",phase=\"$phase\",scenario=~\"$scenario\",level=~\"$level\"})","legendFormat":"{{mode}} in flight"}]},
+    {"id":18,"type":"timeseries","title":"Actual PostgreSQL container CPU (100% = one core)","datasource":{"uid":"prometheus","type":"prometheus"},"gridPos":{"x":0,"y":61,"w":12,"h":7},"fieldConfig":{"defaults":{"unit":"percent","min":0}},"targets":[
+      {"expr":"demo_postgres_cpu_percent and on(instance) (time()-demo_postgres_resource_timestamp_seconds < 10)","legendFormat":"PostgreSQL Docker CPU"}]},
+    {"id":19,"type":"timeseries","title":"Actual PostgreSQL container memory (% of container limit)","datasource":{"uid":"prometheus","type":"prometheus"},"gridPos":{"x":12,"y":61,"w":12,"h":7},"fieldConfig":{"defaults":{"unit":"percent","min":0,"max":100}},"targets":[
+      {"expr":"demo_postgres_memory_percent and on(instance) (time()-demo_postgres_resource_timestamp_seconds < 10)","legendFormat":"PostgreSQL Docker memory"}]}
   ]
 }

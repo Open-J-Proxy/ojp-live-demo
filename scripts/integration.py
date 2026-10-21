@@ -448,11 +448,12 @@ class Integration(unittest.TestCase):
         self.assertGreater(successes, 0)
         self.assertEqual(successes + rejected, concurrency)
         self.assertEqual(completed() - before_completed, successes)
-        self.assertLessEqual(peak, 40)
+        physical_limit = int(E.env.get("OJP_POOL_SIZE", "10"))
+        self.assertLessEqual(peak, physical_limit)
         if not E.options.small:
             self.assertLess(peak, concurrency)
         (E.output / "ojp-sessions.json").write_text(json.dumps({
-            "logical_concurrency": concurrency, "physical_peak": peak, "physical_limit": 40,
+            "logical_concurrency": concurrency, "physical_peak": peak, "physical_limit": physical_limit,
             "sql_successes": successes, "pool_acquisition_rejections": rejected}))
 
     def test_10_phase_histograms_and_level_sql_completions(self):

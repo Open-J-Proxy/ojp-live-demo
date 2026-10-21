@@ -12,17 +12,17 @@ PostgreSQL connections:
 
 Traditional client-side pools can consume many database connections. Open J Proxy
 (OJP) centralizes pooling: applications create logical JDBC connections while
-OJP reuses a 40-connection PostgreSQL backend pool.
+OJP reuses a 10-connection PostgreSQL backend pool.
 
 ```text
 Direct JDBC: 10 × 20 client connections → PostgreSQL (200)
-OJP:         10 instances → logical connections → OJP → PostgreSQL (40)
+OJP:         10 instances → logical connections → OJP → PostgreSQL (10)
 ```
 
 This demo uses one application process with a 200-connection HikariCP pool to
 emulate the aggregate connection footprint of ten services. It is not ten
 independent application instances and does not reproduce every aspect of
-distributed scaling. The comparison deliberately uses 200 versus 40 connections;
+distributed scaling. The comparison deliberately uses 200 versus 10 connections;
 it is not an equal-sized pool benchmark and does not assume OJP is faster.
 
 The default workload is 98% transactional OLTP operations and 2% analytical
@@ -44,10 +44,10 @@ starts retain the existing data.
 ## Open Grafana
 
 Open [http://localhost:3000/d/ojp-benchmark](http://localhost:3000/d/ojp-benchmark)
-and log in with **admin / demo-local-only**. The main dashboard defaults to the
+and log in with **admin / demo-local-only**. The dashboard defaults to the
 measurement phase; choose `warmup` from the phase selector to inspect warm-up.
-The diagnostics dashboard contains separate PostgreSQL connection, transaction
-rate, and tuple-rate graphs.
+See [Grafana metrics reference](docs/TECHNICAL.md#grafana-metrics-reference)
+for what each panel shows and where its data comes from.
 
 ## Run the HTAP benchmark
 
@@ -100,14 +100,14 @@ flowchart LR
     Compose --> OJP["OJP server<br/>slow-query segregation<br/>20% slow lane"]
     Compose --> Exporter["postgres-exporter"]
     Compose --> Prom["Prometheus"]
-    Compose --> Grafana["Grafana<br/>HTAP + diagnostics dashboards"]
+    Compose --> Grafana["Grafana<br/>benchmark dashboard"]
     Seed["scripts/seed-data.sh"] --> PG
     HTAP --> Load["Python open-loop load runner"]
     Load -->|"work requests :8080"| App
     Load -->|"mode / reset / context / arrivals :8081"| App
     App -->|"Direct JDBC<br/>HikariCP min=max 200"| PG
     App -->|"OJP JDBC logical connection<br/>create/close per transaction"| OJP
-    OJP -->|"backend pool max 40"| PG
+    OJP -->|"backend pool min=max 10"| PG
     PG --> Exporter
     App -->|"application metrics :8081"| Prom
     OJP -->|"pool + SQL metrics :9159"| Prom

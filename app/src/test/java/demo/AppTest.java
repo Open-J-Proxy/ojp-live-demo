@@ -14,7 +14,7 @@ class AppTest {
     @Test void defaultsAndDriverProperties() throws Exception {
         Config c = Config.load(Map.of());
         assertEquals(200, c.poolSize()); assertEquals(512, c.workers());
-        assertEquals("40", c.ojpProperties().getProperty("ojp.connection.pool.maximumPoolSize"));
+        assertEquals("10", c.ojpProperties().getProperty("ojp.connection.pool.maximumPoolSize"));
         assertEquals("10", c.ojpProperties().getProperty("ojp.connection.pool.minimumIdle"));
         assertEquals("true", c.ojpProperties().getProperty("ojp.jdbc.connection.close.synchronous"));
         assertTrue(c.ojpUrl().endsWith("ApplicationName=demo-ojp"));

@@ -5,7 +5,7 @@
 The Direct JDBC path uses HikariCP with `minimumIdle=200` and
 `maximumPoolSize=200`. The OJP application path has no local HikariCP pool:
 each transaction opens and closes a logical JDBC connection, while OJP's
-backend pool has a maximum of 40 and minimum idle of 10. HTTP capacity remains
+backend pool has a minimum idle and maximum of 10. HTTP capacity remains
 512 workers by default. These sizes are intentionally asymmetric.
 
 PostgreSQL sessions from the Direct pool use a per-process, unique
@@ -53,16 +53,56 @@ application-owned Direct sessions and OJP backend sessions by mode.
 At each successful measurement, the load runner publishes a saved summary
 labelled by mode, scenario, phase, and RPS level: successful throughput, OLTP
 and OLAP P95, error percentage, dropped requests, physical connections, and
-PostgreSQL CPU. This allows sequential Direct/OJP results to appear side by
-side without pretending their database gauges were sampled simultaneously.
+PostgreSQL CPU as `demo_benchmark_result_*` Prometheus series (not shown on the
+Grafana dashboard). This allows sequential Direct/OJP results to be compared side
+by side without pretending their database gauges were sampled simultaneously.
 Run IDs remain in JSON/CSV result artifacts, not Prometheus labels.
 
-The main Grafana dashboard focuses on load, latency, errors/drops, physical and
-logical connections, PostgreSQL CPU, OJP pool utilization, and a Direct/OJP
-measurement table. The diagnostics dashboard separates PostgreSQL connections,
-transactions per second, and tuples returned per second because they have
-different units and scales. Grafana provisioning is in
+The Grafana dashboard shows offered/dispatched/completed RPS, server and
+end-to-end latency, OLTP versus OLAP P95, errors/rollbacks/drops, Direct
+HikariCP and OJP backend pool gauges, logical connections, OJP SQL
+classifications, and PostgreSQL CPU and memory. Grafana provisioning is in
 `monitoring/grafana/provisioning/`.
+
+### Grafana metrics reference
+
+Prometheus scrapes every 2 seconds (`monitoring/prometheus.yml`) from three
+places: the demo app (`app:8081/metrics`), the OJP server (`ojp:9159`), and
+postgres-exporter (`postgres-exporter:9187`). The app also re-publishes values
+it does not measure itself: load-generator counts pushed to `/arrivals` by
+`load/runner.py`, and PostgreSQL container CPU/memory pushed to `/resources` by
+`scripts/resources.py`.
+
+| Panel | Metric | What it means | How and where it is collected |
+|---|---|---|---|
+| Offered / dispatched / SQL-completed RPS | `demo_load_scheduled_total` | Requests the load generator planned to send | Counted by `load/runner.py` on a fixed timetable; pushed to the app's `/arrivals` about once a second |
+| | `demo_load_dispatched_total` | Requests actually sent | Counted by `load/runner.py`; pushed to `/arrivals` |
+| | `demo_completions_total` (excluding `hold`/`rollback`) | Transactions that committed | +1 in the app (`Database.work`) after each commit |
+| Server P95 / P99 latency | `demo_request_duration_seconds` | Time spent inside the app per request: getting a connection plus running the SQL | Timer in the app from the start of the transaction to commit or rollback; queueing before the app picks up the request is not included |
+| SQL success / errors / rollback rates | `demo_completions_total` | Committed transactions | +1 in the app per commit |
+| | `demo_errors_total` | Failed transactions | +1 in the app when a transaction throws |
+| | `demo_rollbacks_total` | Rolled-back transactions | +1 in the app whenever it rolls a transaction back |
+| Direct HikariCP physical pool | `demo_hikari_active` / `_idle` / `_total` | Connections in the app's own HikariCP pool (Direct mode); 0 in OJP mode | Read from HikariCP's pool counters each time Prometheus scrapes the app |
+| OJP backend physical pool | `ojp_hikari_pool_connections_active_connections` / `_idle_connections` / `_max_connections` | OJP's pool of real PostgreSQL connections | Exported by the OJP server on port 9159 |
+| P95 OLTP versus OLAP | `demo_request_duration_seconds` | Server latency split into analytical `report` queries (OLAP) and all other transactions (OLTP) | Same app timer as Server P95, filtered by the `op` label |
+| HTTP workers / admission queue / requests in flight | `demo_http_workers`, `demo_http_workers_active`, `demo_http_queue`, `demo_inflight` | Worker capacity, busy workers, queued requests, and requests being processed | Read from the app's HTTP worker pool on each scrape |
+| | `demo_rejected_total` | Requests turned away because all worker slots were taken | +1 in the app when a request cannot be admitted |
+| P95 connection acquisition | `demo_acquisition_duration_seconds` | Time the app waits for a connection | App timer around getting a connection: from HikariCP in Direct mode, or a new logical connection to OJP in OJP mode |
+| OJP backend pending threads | `ojp_hikari_pool_connections_pending_threads` | Requests inside OJP waiting for a free backend connection | Exported by the OJP server |
+| Current mode / scenario / phase / RPS level | `demo_context` | The labels the load runner last set on the app | Set through the app's admin endpoint; exported on each scrape |
+| OJP logical connections opened / closed | `demo_logical_connections_opened_total` / `_closed_total` (by `mode`) | JDBC connections the app opened and closed | +1 in the app on every connection open and close |
+| Actual OJP SQL classifications | `ojp_sql_executions_total`, `ojp_sql_slow_executions_total` | All SQL that OJP ran, and the subset it classified as slow | Exported by the OJP server; the slow series appears only after a query is actually classified as slow |
+| Scheduled-arrival to completion P95 / P99 | `demo_load_latency_seconds` | What a user would experience: time from the planned send time to the reply, including client and server queueing | Measured by `load/runner.py`; histogram pushed to `/arrivals` |
+| Generator drops / timeouts / requests in flight | `demo_load_dropped_total` | Planned requests the generator skipped because too many requests were already in flight (`max_in_flight`) | Counted by `load/runner.py`; pushed to `/arrivals` |
+| | `demo_load_timeouts_total` | Sent requests that got no reply before the client timeout | Counted by `load/runner.py`; pushed to `/arrivals` |
+| | `demo_load_inflight` | Requests sent and still waiting for a reply | Counted by `load/runner.py`; pushed to `/arrivals` |
+| PostgreSQL container CPU | `demo_postgres_cpu_percent` | PostgreSQL container CPU; 100% means one core | `scripts/resources.py` runs `docker stats` every second and posts to the app's `/resources`. The panel shows a value only if a sample arrived in the last 10 seconds |
+| PostgreSQL container memory | `demo_postgres_memory_percent` | PostgreSQL container memory as a percentage of its limit | Same `docker stats` sampler as CPU |
+
+Latency appears in four panels because each one times a different part of a
+request. A large gap between end-to-end and server latency means time is lost
+to queueing rather than SQL. A large share of server latency spent in
+connection acquisition indicates pool pressure.
 
 OJP's scrape endpoint also exports live pool gauges and actual SQL execution /
 slow-execution counters. A missing slow-execution series is not proof that a
@@ -73,7 +113,7 @@ query was classified. The benchmark records the absence or increase explicitly.
 | Variable | Default | Purpose |
 |---|---:|---|
 | `DIRECT_POOL_SIZE` | 200 | Direct HikariCP minimum and maximum |
-| `OJP_POOL_SIZE` | 40 | OJP backend pool maximum |
+| `OJP_POOL_SIZE` | 10 | OJP backend pool maximum |
 | `OJP_MIN_IDLE` | 10 | OJP backend idle target |
 | `HTTP_WORKERS` | 512 | Bounded application workers (minimum 200) |
 | `HTTP_QUEUE_SIZE` | 1024 | Bounded HTTP queue |
