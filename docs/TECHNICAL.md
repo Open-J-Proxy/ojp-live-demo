@@ -43,9 +43,9 @@ the measurement. No observed classifications are reported as “not
 demonstrated”; configuration by itself is not treated as evidence that SQL
 entered the slow lane.
 
-### Java source-file producers
+### Java source-file tooling
 
-`load/Runner.java` replaces the Python workload producer. It runs on Java 25
+`load/Runner.java` is the workload producer. It runs on Java 25
 LTS as a compact source file with an instance `main` method: JEP 445 introduced
 this style as a preview, and [JEP 512](https://openjdk.org/jeps/512) finalized it
 in Java 25. No `--enable-preview`, separate compilation, Maven build, or external
@@ -71,9 +71,18 @@ requests or result files. HA orchestration uses it in the load container before
 reconfiguring services, keeping validation in the Java producer.
 
 The load container's internal HTTP bridge and controlled-delay integration
-proxy are also Java source-file scripts. Host-side control, resource sampling,
-failover orchestration, and integration/regression harnesses remain Python 3;
-the application itself still targets Java 21.
+proxy are also Java source-file scripts. Host-side controls (`HttpControls.java`),
+resource sampling and benchmark launch (`Resources.java`), HA orchestration
+(`Failover.java`), and both test harnesses (`Integration.java` and
+`ProducerTest.java`) all reside in `load/` and use the same Java 25 source launcher.
+`DemoTools.java` shares Compose, process, and HTTP support between them.
+Install JDK 25 or newer on the host with both `java` and `javac` on `PATH`;
+no Python runtime or test framework is required. The application itself still
+targets Java 21.
+
+The shell entrypoints launch these sources from any working directory. For
+direct HA orchestration, use `java load/Failover.java --help` from the repository
+root; its options are validated by the same producer before services change.
 
 ## Metrics and result retention
 
@@ -103,7 +112,7 @@ places: the demo app (`app:8081/metrics`), the OJP server (`ojp:9159`), and
 postgres-exporter (`postgres-exporter:9187`). The app also re-publishes values
 it does not measure itself: load-generator counts pushed to `/arrivals` by
 `load/Runner.java`, and PostgreSQL container CPU/memory pushed to `/resources` by
-`scripts/resources.py`.
+`load/Resources.java`.
 
 | Panel | Metric | What it means | How and where it is collected |
 |---|---|---|---|
@@ -128,7 +137,7 @@ it does not measure itself: load-generator counts pushed to `/arrivals` by
 | Generator drops / timeouts / requests in flight | `demo_load_dropped_total` | Planned requests the generator skipped because too many requests were already in flight (`max_in_flight`) | Counted by `load/Runner.java`; pushed to `/arrivals` |
 | | `demo_load_timeouts_total` | Sent requests that got no reply before the client timeout | Counted by `load/Runner.java`; pushed to `/arrivals` |
 | | `demo_load_inflight` | Requests sent and still waiting for a reply | Counted by `load/Runner.java`; pushed to `/arrivals` |
-| PostgreSQL container CPU | `demo_postgres_cpu_percent` | PostgreSQL container CPU; 100% means one core | `scripts/resources.py` runs `docker stats` every second and posts to the app's `/resources`. The panel shows a value only if a sample arrived in the last 10 seconds |
+| PostgreSQL container CPU | `demo_postgres_cpu_percent` | PostgreSQL container CPU; 100% means one core | `load/Resources.java` runs `docker stats` every second and posts to the app's `/resources`. The panel shows a value only if a sample arrived in the last 10 seconds |
 | PostgreSQL container memory | `demo_postgres_memory_percent` | PostgreSQL container memory as a percentage of its limit | Same `docker stats` sampler as CPU |
 
 Latency appears in four panels because each one times a different part of a
@@ -161,8 +170,8 @@ All published ports bind to loopback for this local demonstration.
 ## Validation
 
 ```bash
-# JDK 25 must be available on PATH for producer regression tests.
-python3 -m unittest discover -s load -p 'test_*.py' -v
+# JDK 25 or newer must be available on PATH.
+java load/ProducerTest.java
 mvn -f app/pom.xml verify
 bash scripts/test-integration.sh
 ```
@@ -170,6 +179,6 @@ bash scripts/test-integration.sh
 The live Java database test is gated by `LIVE_DB_TESTS=true`; ordinary Maven
 verification without that environment variable skips its PostgreSQL/OJP test.
 The GitHub Actions workflow installs Temurin 25 for the Java source-file
-producer regressions driven by Python unittest, runs application verification
+producer and orchestration regressions, runs application verification
 on Java 21 with live database coverage, and runs the full 200-session
 integration profile with the Java 25 load image.

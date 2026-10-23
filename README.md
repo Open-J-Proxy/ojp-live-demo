@@ -34,6 +34,9 @@ observed.
 
 ## Start the demo
 
+Install Docker Engine with Compose v2 and **JDK 25 or newer** on your host
+(`java` and `javac` on `PATH`). No Python runtime is required.
+
 ```bash
 bash scripts/start.sh
 ```
@@ -120,9 +123,9 @@ memory snapshots and retains the raw evidence alongside benchmark results.
 The producer runs directly from Java source on **Java 25 LTS**, using compact
 source files and instance `main` methods (the finalized successor to JEP 445,
 [JEP 512](https://openjdk.org/jeps/512)). No preview flags, Maven build, or
-third-party libraries are needed for the producer. Docker supplies its JDK;
-Python 3 is still required on the host for orchestration, resource sampling,
-and the regression test harness. The application retains its Java 21 baseline.
+third-party libraries are needed for the tooling. Docker supplies the producer's
+JDK; host orchestration, resource sampling, and both test harnesses also run as
+Java source files using the host JDK. The application retains its Java 21 baseline.
 
 ## Understand the results
 

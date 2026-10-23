@@ -37,8 +37,8 @@ jobs:
         with:
           distribution: temurin
           java-version: '25'
-      - name: Java producer regression tests (Python unittest harness)
-        run: python3 -m unittest discover -s load -p 'test_*.py' -v
+      - name: Java producer and orchestration regression tests
+        run: java load/ProducerTest.java
       - name: Start and seed Java test databases
         run: |
           bash scripts/verify-environment.sh
@@ -80,6 +80,11 @@ jobs:
         with:
           ref: ${{ github.event.review.commit_id || github.sha }}
           persist-credentials: false
+      - name: Set up Java 25 for integration tooling
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: '25'
       - name: Full integration suite (200 direct sessions)
         run: bash scripts/test-integration.sh
       - name: Upload integration evidence

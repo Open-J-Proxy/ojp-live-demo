@@ -11,7 +11,7 @@ Without a flag, restores the seeded application baseline through POST /reset.
     compose --profile ha --profile tools down --volumes --remove-orphans
     ;;
   '')
-    python3 "$SCRIPT_DIR/http_client.py" reset --url "$(application_url)"
+    java "$ROOT_DIR/load/HttpControls.java" reset --url "$(application_url)"
     ;;
   *) echo 'Unknown option; volume deletion requires --destroy-data (see --help)' >&2; exit 2 ;;
 esac

@@ -14,4 +14,4 @@ Repeat --only to select multiple related checks. Real SQL never uses artificial 
   exit 0
 fi
 preflight
-exec python3 "$SCRIPT_DIR/integration.py" "$@"
+exec java "$ROOT_DIR/load/Integration.java" "$@"

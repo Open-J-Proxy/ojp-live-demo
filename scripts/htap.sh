@@ -65,6 +65,7 @@ for property in \
   fi
 done
 
+compose up -d --no-deps --force-recreate --wait --wait-timeout "${START_TIMEOUT:-180}" app
 export OJP_SLOW_QUERY_SEGREGATION_VERIFIED=true
 mkdir -p "$RESULTS_DIR"
-python3 "$SCRIPT_DIR/resources.py" "$@"
+java "$ROOT_DIR/load/Resources.java" "$@"
