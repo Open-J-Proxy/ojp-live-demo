@@ -10,12 +10,15 @@ import json
 import os
 from pathlib import Path
 import shutil
+import socket
 import subprocess
 import tempfile
 import threading
 import time
 import unittest
 from unittest.mock import MagicMock, patch
+import urllib.error
+import urllib.request
 from urllib.parse import parse_qs, urlsplit
 
 
@@ -49,10 +52,11 @@ class Application:
                 pass
 
             def do_GET(self):
+                self.payload = b""
                 self.respond()
 
             def do_POST(self):
-                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                self.payload = self.rfile.read(int(self.headers.get("Content-Length", "0")))
                 self.respond()
 
             def respond(self):
@@ -60,7 +64,10 @@ class Application:
                 query = {key: values[0] for key, values in parse_qs(
                     parsed.query, keep_blank_values=True).items()}
                 event = {"method": self.command, "path": parsed.path, "query": query,
-                         "authorization": self.headers.get("Authorization")}
+                         "authorization": self.headers.get("Authorization"),
+                         "content_type": self.headers.get("Content-Type"),
+                         "body": getattr(self, "payload", b"").decode(),
+                         "received_at": time.monotonic()}
                 with app.lock:
                     if parsed.path == "/mode":
                         app.mode = query["value"]
@@ -137,8 +144,10 @@ class RunnerTests(unittest.TestCase):
             raise RuntimeError("JDK 25 java must be available via JAVA_HOME or PATH")
         javac = str(Path(cls.java).resolve().with_name("javac"))
         cls.source = ROOT / "load" / "Runner.java"
+        sources = [ROOT / "load" / name for name in
+                   ("Runner.java", "LoadJson.java", "HttpBridge.java", "DelayProxy.java")]
         compiled = subprocess.run([javac, "--release", "25", "-d", str(cls.directory),
-                                   str(cls.source), str(ROOT / "load" / "LoadJson.java")],
+                                   *map(str, sources)],
                                   capture_output=True, text=True, timeout=60)
         if compiled.returncode:
             raise RuntimeError("JDK 25 compilation failed:\n" + compiled.stdout + compiled.stderr)
@@ -601,6 +610,114 @@ class RunnerTests(unittest.TestCase):
         self.assertIsNone(classification["observed"])
         self.assertIsNone(classification["count"])
         self.assertIn("unavailable", classification["message"])
+
+    def test_stdio_http_bridge_preserves_ids_status_body_errors_and_admin_header(self):
+        def control(event):
+            if event["path"] == "/echo":
+                return 201, {"echo": "snowman \u2603\nquoted \"value\""}, 0
+            if event["path"] == "/unavailable":
+                return 503, "upstream unavailable", 0
+            return None
+
+        with Application(control=control).serve() as app:
+            messages = [
+                {"id": "ready", "url": app.url + "/ready", "timeout": 5},
+                {"id": 42, "url": app.url + "/echo?text=a%26b", "timeout": 5,
+                 "method": "POST", "data": {"nested": [None, True, 3, "snowman \u2603"]},
+                 "headers": {"Authorization": "Bearer " + "fixture-only",
+                             "Content-Type": "application/json"}},
+                {"id": "http-error", "url": app.url + "/unavailable", "timeout": 5},
+                {"id": "invalid-url", "url": "http://[broken?private-marker", "timeout": 5},
+            ]
+            result = subprocess.run(
+                [self.java, "-cp", str(self.directory), "HttpBridge"],
+                input="\n".join(map(json.dumps, messages)) + "\n",
+                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        replies = {reply["id"]: reply for reply in
+                   map(json.loads, result.stdout.splitlines())}
+        self.assertEqual(set(replies), {"ready", 42, "http-error", "invalid-url"})
+        self.assertEqual(replies["ready"]["status"], 200)
+        self.assertTrue(json.loads(replies["ready"]["body"])["ready"])
+        self.assertEqual(replies[42]["status"], 201)
+        self.assertEqual(json.loads(replies[42]["body"]),
+                         {"echo": "snowman \u2603\nquoted \"value\""})
+        self.assertEqual(replies["http-error"]["status"], 503)
+        self.assertEqual(replies["http-error"]["body"], "upstream unavailable")
+        self.assertIn("error", replies["invalid-url"])
+        self.assertNotIn("status", replies["invalid-url"])
+        self.assertNotIn("private-marker", replies["invalid-url"]["error"])
+        posted = app.requests("/echo")[0]
+        self.assertEqual(posted["query"], {"text": "a&b"})
+        self.assertEqual(json.loads(posted["body"]), messages[1]["data"])
+        self.assertEqual(posted["authorization"], "Bearer " + "fixture-only")
+        self.assertEqual(posted["content_type"], "application/json")
+        self.assertIsNone(app.requests("/ready")[0]["authorization"])
+
+    def test_delay_proxy_forwards_query_post_body_status_and_delays_work(self):
+        def control(event):
+            if event["path"] == "/echo":
+                return 201, {"echo": event["body"]}, 0
+            if event["path"] == "/unavailable":
+                return 503, "upstream unavailable", 0
+            return None
+
+        with socket.socket() as reservation:
+            reservation.bind(("127.0.0.1", 0))
+            port = reservation.getsockname()[1]
+        with Application(control=control).serve() as app:
+            environment = dict(os.environ, TARGET_APP_URL=app.url, PORT=str(port))
+            process = subprocess.Popen(
+                [self.java, "-cp", str(self.directory), "DelayProxy"],
+                env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            try:
+                base = f"http://127.0.0.1:{port}"
+                deadline = time.monotonic() + 20
+                while True:
+                    if process.poll() is not None:
+                        self.fail("DelayProxy exited: " + process.communicate()[1])
+                    try:
+                        with urllib.request.urlopen(base + "/ready", timeout=1) as response:
+                            self.assertTrue(json.load(response)["ready"])
+                        break
+                    except (OSError, urllib.error.URLError):
+                        if time.monotonic() >= deadline:
+                            self.fail("DelayProxy did not become responsive")
+                        time.sleep(.05)
+                started = time.monotonic()
+                with urllib.request.urlopen(
+                        base + "/work?op=report&phase=measure&seed=7", timeout=5) as response:
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(json.load(response)["operation"], "report")
+                forwarded = app.requests("/work")[0]
+                self.assertGreaterEqual(forwarded["received_at"] - started, .20)
+                self.assertEqual(forwarded["query"],
+                                 {"op": "report", "phase": "measure", "seed": "7"})
+                payload = b'{"message":"forwarded"}'
+                request = urllib.request.Request(
+                    base + "/echo?label=a%26b", data=payload, method="POST",
+                    headers={"Authorization": "Bearer " + "fixture-only",
+                             "Content-Type": "application/json"})
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    self.assertEqual(response.status, 201)
+                    self.assertEqual(json.load(response)["echo"], payload.decode())
+                posted = app.requests("/echo")[0]
+                self.assertEqual(posted["method"], "POST")
+                self.assertEqual(posted["query"], {"label": "a&b"})
+                self.assertEqual(posted["authorization"], "Bearer " + "fixture-only")
+                self.assertEqual(posted["content_type"], "application/json")
+                with self.assertRaises(urllib.error.HTTPError) as failed:
+                    urllib.request.urlopen(base + "/unavailable", timeout=5)
+                self.assertEqual(failed.exception.code, 503)
+                self.assertEqual(failed.exception.read(), b"upstream unavailable")
+                failed.exception.close()
+            finally:
+                process.terminate()
+                try:
+                    process.communicate(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.communicate(timeout=5)
 
     def test_htap_entrypoint_enforces_segregation_and_removes_old_benchmarks(self):
         script = (ROOT / "scripts" / "htap.sh").read_text()

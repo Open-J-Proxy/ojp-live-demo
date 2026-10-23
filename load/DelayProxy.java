@@ -16,7 +16,8 @@ void main() throws Exception {
     if (target == null || target.isBlank()) {
         throw new IllegalArgumentException("TARGET_APP_URL is required");
     }
-    var server = HttpServer.create(new InetSocketAddress("0.0.0.0", 8080), 0);
+    int port = Integer.parseInt(System.getenv().getOrDefault("PORT", "8080"));
+    var server = HttpServer.create(new InetSocketAddress("0.0.0.0", port), 0);
     server.setExecutor(Executors.newVirtualThreadPerTaskExecutor());
     server.createContext("/", this::forward);
     server.start();
