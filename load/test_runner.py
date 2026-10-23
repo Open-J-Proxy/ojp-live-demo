@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import random
+import select
 import shutil
 import socket
 import subprocess
@@ -30,11 +31,13 @@ OPERATIONS = ("browse", "history", "checkout", "review", "account", "report")
 class Application:
     """Real HTTP control/work/metrics fixture, retaining the producer's wire traffic."""
 
-    def __init__(self, work=None, control=None, arrivals_delay=0, slow_metrics=True):
+    def __init__(self, work=None, control=None, arrivals_delay=0, slow_metrics=True,
+                 body_delay=0):
         self.work = work
         self.control = control
         self.arrivals_delay = arrivals_delay
         self.slow_metrics = slow_metrics
+        self.body_delay = body_delay
         self.events = []
         self.lock = threading.Lock()
         self.mode = "direct"
@@ -108,6 +111,9 @@ class Application:
                     self.send_header("Content-Length", str(len(payload)))
                     self.send_header("Content-Type", "application/json")
                     self.end_headers()
+                    event["headers_sent_at"] = time.monotonic()
+                    if parsed.path == "/work" and query.get("phase") == "measure":
+                        time.sleep(app.body_delay)
                     self.wfile.write(payload)
                 except (BrokenPipeError, ConnectionResetError):
                     pass
@@ -676,6 +682,45 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(posted["authorization"], "Bearer " + "fixture-only")
         self.assertEqual(posted["content_type"], "application/json")
         self.assertIsNone(app.requests("/ready")[0]["authorization"])
+
+    def test_stdio_http_bridge_body_timeout_then_recovers_and_drains_on_eof(self):
+        with Application(body_delay=.5).serve() as app:
+            process = subprocess.Popen(
+                [self.java, "-cp", str(self.directory), "HttpBridge"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+            def exchange(message):
+                process.stdin.write(json.dumps(message) + "\n")
+                process.stdin.flush()
+                readable, _, _ = select.select([process.stdout], [], [], 15)
+                self.assertTrue(readable, "HTTP bridge did not reply")
+                return json.loads(process.stdout.readline())
+
+            try:
+                warmup = exchange({"id": "warmup", "url": app.url + "/ready", "timeout": 5})
+                self.assertEqual(warmup["status"], 200)
+                timeout = exchange({
+                    "id": "body-timeout", "timeout": .15,
+                    "url": app.url + "/work?op=browse&phase=measure"})
+                self.assertEqual(timeout["id"], "body-timeout")
+                self.assertIn("error", timeout)
+                self.assertIn("headers_sent_at", app.requests("/work")[0])
+                recovered = exchange({"id": "recovered", "url": app.url + "/ready", "timeout": 5})
+                self.assertEqual(recovered["id"], "recovered")
+                self.assertEqual(recovered["status"], 200)
+                process.stdin.close()
+                process.stdin = None
+                stdout, stderr = process.communicate(timeout=10)
+                self.assertEqual(process.returncode, 0, stdout + stderr)
+                self.assertEqual(stdout, "")
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.communicate(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.communicate(timeout=5)
 
     def test_delay_proxy_forwards_query_post_body_status_and_delays_work(self):
         def control(event):
