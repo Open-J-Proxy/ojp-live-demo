@@ -5,6 +5,8 @@ import java.net.URI;
 import java.net.ServerSocket;
 import java.net.http.*;
 import java.time.Duration;
+import java.sql.SQLException;
+import java.sql.SQLTransientConnectionException;
 import java.util.*;
 import java.util.concurrent.*;
 
@@ -68,6 +70,17 @@ class AppTest {
         assertEquals("a b", Main.query("op=a+b").get("op"));
         assertThrows(IllegalArgumentException.class, () -> Main.query("op=a&op=b"));
         assertEquals("\"\\\"\\n\\u0001\"", Json.encode("\"\n\u0001"));
+    }
+
+    @Test void admissionTimeoutWithoutSqlStateRetainsConnectionFailureCode() {
+        assertEquals("08001", Main.errorCode(new SQLTransientConnectionException("admission timeout")));
+        assertEquals("08001", Main.errorCode(new SQLTransientConnectionException("admission timeout", "")));
+        assertEquals("08001", Main.errorCode(new SQLTransientConnectionException("admission timeout", " ")));
+        assertEquals("08003", Main.errorCode(new SQLTransientConnectionException("closed connection", "08003")));
+        assertEquals("42601", Main.errorCode(new SQLException("syntax error", "42601")));
+        assertEquals("", Main.errorCode(new SQLException("unspecified SQL failure", "")));
+        assertEquals("unknown", Main.errorCode(new SQLException("unspecified SQL failure")));
+        assertEquals("IOException", Main.errorCode(new java.io.IOException("transport failure")));
     }
 
     @Test void startupDiagnosticsPreservePostgresFailureCause() {

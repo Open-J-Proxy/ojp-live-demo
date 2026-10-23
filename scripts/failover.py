@@ -8,16 +8,16 @@ import os
 from pathlib import Path
 import re
 import subprocess
-import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
 from resources import ResourceSampler
+from compose_command import compose_command
 
 ROOT = Path(__file__).resolve().parent.parent
-COMPOSE = ["docker", "compose", "--project-directory", str(ROOT), "-f", str(ROOT / "compose.yaml")]
+COMPOSE = compose_command()
 
 
 def now():
@@ -58,25 +58,31 @@ def application_url():
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--recovery-timeout", type=float, default=60)
     parser.add_argument("--mode", choices=["ojp"], default="ojp")
     parser.add_argument("--warmup", type=float, default=5)
     parser.add_argument("--duration", type=float, default=30)
     parser.add_argument("--run-id", default="failover-" + uuid.uuid4().hex[:12])
     parser.add_argument("--scenario", default="failover")
+    parser.add_argument("--warmup-only", action="store_true")
+    parser.add_argument("--validate-only", action="store_true")
     args, forwarded = parser.parse_known_args()
     if (not all(map(math.isfinite, (args.recovery_timeout, args.duration, args.warmup)))
             or args.recovery_timeout <= 0 or args.duration < 3 or args.warmup < 0):
         parser.error("recovery timeout must be positive, duration >= 3 and warmup >= 0")
-    sys.path.insert(0, str(ROOT / "load"))
-    from runner import arguments as load_arguments
-    validated = load_arguments([
+    if args.warmup_only or args.validate_only:
+        parser.error("failover requires measurement; --warmup-only and --validate-only are not supported")
+    load_options = [
         "--mode", "ojp", "--scenario", args.scenario, "--run-id", args.run_id,
         "--warmup", str(args.warmup), "--duration", str(args.duration), *forwarded,
+    ]
+    validation = subprocess.run(COMPOSE + [
+        "--profile", "tools", "run", "--rm", "--no-deps", "load", "--validate-only",
+        *load_options,
     ])
-    if validated.warmup_only:
-        parser.error("failover requires measurement; --warmup-only is not supported")
+    if validation.returncode:
+        raise SystemExit(validation.returncode)
     output = Path(os.environ.get("RESULTS_DIR", ROOT / "results"))
     output.mkdir(parents=True, exist_ok=True)
     safe_id = "".join(c if c.isalnum() or c in "._-" else "_" for c in args.run_id)
@@ -105,9 +111,7 @@ def main():
                             "--user", os.environ.get("LOCAL_UID", str(os.getuid())) + ":"
                             + os.environ.get("LOCAL_GID", str(os.getgid())),
                             "load", "--output", "/results",
-                            "--mode", "ojp", "--scenario", args.scenario,
-                            "--warmup", str(args.warmup), "--duration", str(args.duration),
-                            "--run-id", args.run_id] + forwarded
+                            *load_options]
         log = log_path.open("w")
         process = subprocess.Popen(runner, stdout=log, stderr=subprocess.STDOUT, env=env)
         deadline = time.monotonic() + args.warmup + 180

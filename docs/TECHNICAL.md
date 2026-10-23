@@ -66,6 +66,10 @@ with a local JDK 25, inspect the producer CLI directly:
 java load/Runner.java --help
 ```
 
+The internal `--validate-only` option checks producer options without HTTP
+requests or result files. HA orchestration uses it in the load container before
+reconfiguring services, keeping validation in the Java producer.
+
 The load container's internal HTTP bridge and controlled-delay integration
 proxy are also Java source-file scripts. Host-side control, resource sampling,
 failover orchestration, and integration/regression harnesses remain Python 3;

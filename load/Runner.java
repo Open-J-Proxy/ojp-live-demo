@@ -60,7 +60,7 @@ static class Args {
     double warmup = 10, duration = 30, requestTimeout = 30, controlTimeout = 210, readinessTimeout = 90;
     int maxInFlight = 512, oltpPercent = 98, olapPercent = 2;
     BigInteger seed = BigInteger.valueOf(12345);
-    boolean warmupOnly;
+    boolean warmupOnly, validateOnly;
     String runId = UUID.randomUUID().toString().replace("-", "").substring(0, 12);
     String ojpMetricsUrl = "http://ojp:9159/metrics";
     Map<String, Integer> operationMix;
@@ -137,9 +137,10 @@ static Args arguments(String[] argv) {
         int equals = option.indexOf('=');
         if (equals >= 0) { value = option.substring(equals + 1); option = option.substring(0, equals); }
         if ((option.equals("--help") || option.equals("-h")) && value == null) throw new HelpRequested();
-        if (option.equals("--warmup-only")) {
-            if (value != null) throw new IllegalArgumentException("--warmup-only does not take a value");
-            args.warmupOnly = true;
+        if (option.equals("--warmup-only") || option.equals("--validate-only")) {
+            if (value != null) throw new IllegalArgumentException(option + " does not take a value");
+            if (option.equals("--warmup-only")) args.warmupOnly = true;
+            else args.validateOnly = true;
             continue;
         }
         if (value == null) {
@@ -208,6 +209,7 @@ static void help() {
                                          (default: 8,256,8,8; baseline, spike, two post-spike windows)
               --warmup SECONDS           fully drained arrival window (default: 10; zero allowed)
               --warmup-only              reset, readiness, warm up and drain; never measure
+              --validate-only            validate options without requests or result files
               --duration SECONDS         measurement arrivals excluding drain (default: 30)
               --max-in-flight INTEGER    maximum outstanding requests (default: 512)
               --request-timeout SECONDS  measured SQL timeout including body (default: 30)
@@ -1003,6 +1005,7 @@ static int run(String[] argv) {
     try { args = arguments(argv); }
     catch (HelpRequested e) { help(); return 0; }
     catch (IllegalArgumentException e) { System.err.println("ERROR: " + e.getMessage()); return 2; }
+    if (args.validateOnly) return 0;
     if (args.scenario.equals("htap") && !args.mode.equals("direct")
             && !"true".equals(System.getenv("OJP_SLOW_QUERY_SEGREGATION_VERIFIED"))) {
         System.err.println("ERROR: OJP HTAP requires scripts/htap.sh to verify the running server's slow-query segregation configuration.");

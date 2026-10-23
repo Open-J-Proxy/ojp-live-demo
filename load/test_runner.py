@@ -14,6 +14,7 @@ import select
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -816,6 +817,58 @@ class RunnerTests(unittest.TestCase):
                                         capture_output=True, text=True, timeout=5)
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
                 self.assertIn("HTAP always measures Direct JDBC then OJP", result.stderr)
+
+    def test_validate_only_checks_options_without_requests_or_results(self):
+        with Application().serve() as app:
+            result, directory = self.invoke([
+                "--validate-only", "--url", app.url, "--mode", "ojp", "--rps", "10"])
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(list(directory.iterdir()))
+            self.assertEqual(app.events, [])
+            for options in (["--rps", "0"], ["--duration", "nan"],
+                            ["--operation-mix", "report=100"], ["--validate-only=true"]):
+                with self.subTest(options=options):
+                    result, _ = self.invoke(["--validate-only", "--url", app.url, *options])
+                    self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertEqual(app.events, [])
+
+    def test_failover_validates_with_java_before_mutating_services(self):
+        override = str(self.directory / "compose.override.json")
+        with patch.object(sys, "path", [str(ROOT / "scripts"), *sys.path]), \
+                patch.dict(os.environ, {"COMPOSE_OVERRIDE_FILE": override}):
+            spec = importlib.util.spec_from_file_location("failover_test", ROOT / "scripts" / "failover.py")
+            failover = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(failover)
+        self.assertEqual(failover.COMPOSE[-2:], ["-f", override])
+        options = ["--run-id", "test-ha", "--rps", "10", "--warmup", "1", "--duration", "8"]
+        for status in (0, 2):
+            with self.subTest(status=status), \
+                    patch.object(sys, "argv", ["failover.py", *options]), \
+                    patch.object(failover.subprocess, "run",
+                                 return_value=subprocess.CompletedProcess([], status)) as run, \
+                    patch.object(failover, "ResourceSampler", side_effect=RuntimeError("validated")) as sampler, \
+                    patch.dict(os.environ, {"RESULTS_DIR": str(self.directory / "failover")}):
+                with self.assertRaises(SystemExit if status else RuntimeError) as stopped:
+                    failover.main()
+                command = run.call_args.args[0]
+                self.assertEqual(command, failover.COMPOSE + [
+                    "--profile", "tools", "run", "--rm", "--no-deps", "load", "--validate-only",
+                    "--mode", "ojp", "--scenario", "failover", "--run-id", "test-ha",
+                    "--warmup", "1.0", "--duration", "8.0", "--rps", "10"])
+                run.assert_called_once()
+                if status:
+                    self.assertEqual(stopped.exception.code, status)
+                    sampler.assert_not_called()
+                else:
+                    sampler.assert_called_once()
+        for flag in ("--warmup-only", "--validate-only"):
+            with self.subTest(flag=flag), \
+                    patch.object(sys, "argv", ["failover.py", flag]), \
+                    patch.object(failover.subprocess, "run") as run:
+                with self.assertRaises(SystemExit) as stopped:
+                    failover.main()
+                self.assertEqual(stopped.exception.code, 2)
+                run.assert_not_called()
 
     def test_htap_rebuilds_runner_before_sampling_and_running(self):
         path = ROOT / "scripts" / "resources.py"
