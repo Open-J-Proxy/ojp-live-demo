@@ -13,7 +13,7 @@ permissions:
   contents: read
 
 jobs:
-  java-and-python:
+  java-and-producer:
     if: >-
       github.event_name != 'pull_request_review' ||
       (github.event.review.state == 'approved' &&
@@ -32,7 +32,12 @@ jobs:
         with:
           ref: ${{ github.event.review.commit_id || github.sha }}
           persist-credentials: false
-      - name: Python runner tests
+      - name: Set up Java 25 for source-file producers
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: '25'
+      - name: Java producer regression tests (Python unittest harness)
         run: python3 -m unittest discover -s load -p 'test_*.py' -v
       - name: Start and seed Java test databases
         run: |

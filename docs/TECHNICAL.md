@@ -43,6 +43,35 @@ the measurement. No observed classifications are reported as “not
 demonstrated”; configuration by itself is not treated as evidence that SQL
 entered the slow lane.
 
+### Java source-file producers
+
+`load/Runner.java` replaces the Python workload producer. It runs on Java 25
+LTS as a compact source file with an instance `main` method: JEP 445 introduced
+this style as a preview, and [JEP 512](https://openjdk.org/jeps/512) finalized it
+in Java 25. No `--enable-preview`, separate compilation, Maven build, or external
+dependencies are required. The load image includes a JDK, not just a JRE,
+because the Java source launcher compiles the scripts at startup.
+
+The producer retains the existing CLI, JSON/CSV result schema, fixed-rate
+open-loop arrivals, exact-ratio workload blocks, bounded outstanding requests,
+and separate request/control timeouts. Requests use virtual threads; reaching
+`--max-in-flight` records a drop rather than blocking the arrival schedule.
+Warm-up and measurement drain independently, and Direct/OJP use the same seeded
+work plan. Java's seeded random sequence need not match the former Python
+sequence, so historical results should not be assumed to use identical requests.
+
+Docker remains the normal execution path via `scripts/htap.sh`. For development
+with a local JDK 25, inspect the producer CLI directly:
+
+```bash
+java load/Runner.java --help
+```
+
+The load container's internal HTTP bridge and controlled-delay integration
+proxy are also Java source-file scripts. Host-side control, resource sampling,
+failover orchestration, and integration/regression harnesses remain Python 3;
+the application itself still targets Java 21.
+
 ## Metrics and result retention
 
 Application request and load metrics use bounded labels for `mode`, `op`,
@@ -70,13 +99,13 @@ Prometheus scrapes every 2 seconds (`monitoring/prometheus.yml`) from three
 places: the demo app (`app:8081/metrics`), the OJP server (`ojp:9159`), and
 postgres-exporter (`postgres-exporter:9187`). The app also re-publishes values
 it does not measure itself: load-generator counts pushed to `/arrivals` by
-`load/runner.py`, and PostgreSQL container CPU/memory pushed to `/resources` by
+`load/Runner.java`, and PostgreSQL container CPU/memory pushed to `/resources` by
 `scripts/resources.py`.
 
 | Panel | Metric | What it means | How and where it is collected |
 |---|---|---|---|
-| Offered / dispatched / SQL-completed RPS | `demo_load_scheduled_total` | Requests the load generator planned to send | Counted by `load/runner.py` on a fixed timetable; pushed to the app's `/arrivals` about once a second |
-| | `demo_load_dispatched_total` | Requests actually sent | Counted by `load/runner.py`; pushed to `/arrivals` |
+| Offered / dispatched / SQL-completed RPS | `demo_load_scheduled_total` | Requests the load generator planned to send | Counted by `load/Runner.java` on a fixed timetable; pushed to the app's `/arrivals` about once a second |
+| | `demo_load_dispatched_total` | Requests actually sent | Counted by `load/Runner.java`; pushed to `/arrivals` |
 | | `demo_completions_total` (excluding `hold`/`rollback`) | Transactions that committed | +1 in the app (`Database.work`) after each commit |
 | Server P95 / P99 latency | `demo_request_duration_seconds` | Time spent inside the app per request: getting a connection plus running the SQL | Timer in the app from the start of the transaction to commit or rollback; queueing before the app picks up the request is not included |
 | SQL success / errors / rollback rates | `demo_completions_total` | Committed transactions | +1 in the app per commit |
@@ -92,10 +121,10 @@ it does not measure itself: load-generator counts pushed to `/arrivals` by
 | Current mode / scenario / phase / RPS level | `demo_context` | The labels the load runner last set on the app | Set through the app's admin endpoint; exported on each scrape |
 | OJP logical connections opened / closed | `demo_logical_connections_opened_total` / `_closed_total` (by `mode`) | JDBC connections the app opened and closed | +1 in the app on every connection open and close |
 | Actual OJP SQL classifications | `ojp_sql_executions_total`, `ojp_sql_slow_executions_total` | All SQL that OJP ran, and the subset it classified as slow | Exported by the OJP server; the slow series appears only after a query is actually classified as slow |
-| Scheduled-arrival to completion P95 / P99 | `demo_load_latency_seconds` | What a user would experience: time from the planned send time to the reply, including client and server queueing | Measured by `load/runner.py`; histogram pushed to `/arrivals` |
-| Generator drops / timeouts / requests in flight | `demo_load_dropped_total` | Planned requests the generator skipped because too many requests were already in flight (`max_in_flight`) | Counted by `load/runner.py`; pushed to `/arrivals` |
-| | `demo_load_timeouts_total` | Sent requests that got no reply before the client timeout | Counted by `load/runner.py`; pushed to `/arrivals` |
-| | `demo_load_inflight` | Requests sent and still waiting for a reply | Counted by `load/runner.py`; pushed to `/arrivals` |
+| Scheduled-arrival to completion P95 / P99 | `demo_load_latency_seconds` | What a user would experience: time from the planned send time to the reply, including client and server queueing | Measured by `load/Runner.java`; histogram pushed to `/arrivals` |
+| Generator drops / timeouts / requests in flight | `demo_load_dropped_total` | Planned requests the generator skipped because too many requests were already in flight (`max_in_flight`) | Counted by `load/Runner.java`; pushed to `/arrivals` |
+| | `demo_load_timeouts_total` | Sent requests that got no reply before the client timeout | Counted by `load/Runner.java`; pushed to `/arrivals` |
+| | `demo_load_inflight` | Requests sent and still waiting for a reply | Counted by `load/Runner.java`; pushed to `/arrivals` |
 | PostgreSQL container CPU | `demo_postgres_cpu_percent` | PostgreSQL container CPU; 100% means one core | `scripts/resources.py` runs `docker stats` every second and posts to the app's `/resources`. The panel shows a value only if a sample arrived in the last 10 seconds |
 | PostgreSQL container memory | `demo_postgres_memory_percent` | PostgreSQL container memory as a percentage of its limit | Same `docker stats` sampler as CPU |
 
@@ -129,6 +158,7 @@ All published ports bind to loopback for this local demonstration.
 ## Validation
 
 ```bash
+# JDK 25 must be available on PATH for producer regression tests.
 python3 -m unittest discover -s load -p 'test_*.py' -v
 mvn -f app/pom.xml verify
 bash scripts/test-integration.sh
@@ -136,5 +166,7 @@ bash scripts/test-integration.sh
 
 The live Java database test is gated by `LIVE_DB_TESTS=true`; ordinary Maven
 verification without that environment variable skips its PostgreSQL/OJP test.
-The GitHub Actions workflow runs Python tests, Java verification with live
-database coverage, and the full 200-session integration profile.
+The GitHub Actions workflow installs Temurin 25 for the Java source-file
+producer regressions driven by Python unittest, runs application verification
+on Java 21 with live database coverage, and runs the full 200-session
+integration profile with the Java 25 load image.

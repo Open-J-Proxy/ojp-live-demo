@@ -25,34 +25,6 @@ ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "scripts"
 COMPOSE = ["docker", "compose", "--project-directory", str(ROOT), "-f", str(ROOT / "compose.yaml")]
 TABLES = ("users", "products", "orders", "order_items", "reviews")
-DELAY_PROXY = r'''
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-import os, time, urllib.request, urllib.error
-class Proxy(BaseHTTPRequestHandler):
-    def log_message(self, *args): pass
-    def forward(self):
-        if self.path.startswith("/work?"):
-            time.sleep(.25)
-        data = self.rfile.read(int(self.headers.get("Content-Length", "0"))) if self.command == "POST" else None
-        headers = {}
-        if self.headers.get("Authorization"):
-            headers["Authorization"] = self.headers["Authorization"]
-        request = urllib.request.Request(os.environ["TARGET_APP_URL"] + self.path, data=data,
-                                         method=self.command, headers=headers)
-        try:
-            response = urllib.request.urlopen(request, timeout=60)
-        except urllib.error.HTTPError as error:
-            response = error
-        with response:
-            body = response.read()
-            self.send_response(response.code)
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-    do_GET = forward
-    do_POST = forward
-ThreadingHTTPServer(("0.0.0.0", 8080), Proxy).serve_forever()
-'''
 
 
 def metric_rows(text, name):
@@ -771,8 +743,8 @@ class Integration(unittest.TestCase):
         try:
             E.compose("--profile", "tools", "run", "-d", "--rm", "--no-deps",
                       "--name", name, "--env", "TARGET_APP_URL=" + E.env["APP_INTERNAL_URL"],
-                      "--entrypoint", "python", "load", "-u", "-c", DELAY_PROXY)
-            deadline = time.monotonic() + 30
+                      "--entrypoint", "java", "load", "/app/DelayProxy.java")
+            deadline = time.monotonic() + 60
             while time.monotonic() < deadline:
                 try:
                     if E.call("/health", base="http://" + name + ":8080", timeout=3)[0] == 200:
@@ -810,9 +782,10 @@ class Integration(unittest.TestCase):
         )
         for arguments in invalid:
             with self.subTest(arguments=arguments):
-                command = [sys.executable, str(ROOT / "load" / "runner.py"), *arguments]
+                command = compose_command(E.env) + [
+                    "--profile", "tools", "run", "--rm", "--no-deps", "-T", "load", *arguments]
                 result = subprocess.run(command, cwd=ROOT, env=E.env, capture_output=True,
-                                        text=True, timeout=15)
+                                        text=True, timeout=60)
                 E.commands.write("$ " + " ".join(command) + "\n" + result.stderr)
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
 

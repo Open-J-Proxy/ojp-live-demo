@@ -100,7 +100,7 @@ flowchart LR
         Prom["Prometheus"]
         Grafana["Grafana"]
     end
-    Load["Python open-loop load runner"] --> App
+    Load["Java open-loop load runner"] --> App
     App -->|"Direct JDBC"| PG
     App -->|"OJP JDBC"| OJP
     OJP --> PG
@@ -116,6 +116,13 @@ Direct JDBC and OJP are exercised sequentially by the same runner. The app
 exports labeled application metrics; Prometheus also scrapes OJP and PostgreSQL
 exporter telemetry. The host-side resource sampler publishes PostgreSQL CPU and
 memory snapshots and retains the raw evidence alongside benchmark results.
+
+The producer runs directly from Java source on **Java 25 LTS**, using compact
+source files and instance `main` methods (the finalized successor to JEP 445,
+[JEP 512](https://openjdk.org/jeps/512)). No preview flags, Maven build, or
+third-party libraries are needed for the producer. Docker supplies its JDK;
+Python 3 is still required on the host for orchestration, resource sampling,
+and the regression test harness. The application retains its Java 21 baseline.
 
 ## Understand the results
 

@@ -1,6 +1,6 @@
-FROM python:3.12-slim
+FROM eclipse-temurin:25-jdk
 RUN mkdir /work && chown 65534:65534 /work
 WORKDIR /work
-COPY load/runner.py /app/runner.py
+COPY load/*.java /app/
 USER 65534:65534
-ENTRYPOINT ["python", "-u", "/app/runner.py"]
+ENTRYPOINT ["java", "/app/Runner.java"]

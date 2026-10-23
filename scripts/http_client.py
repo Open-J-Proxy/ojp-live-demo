@@ -12,32 +12,6 @@ import time
 import urllib.request
 from compose_command import compose_command
 
-CLIENT = r'''
-from concurrent.futures import ThreadPoolExecutor
-import json, sys, threading, urllib.request, urllib.error
-lock = threading.Lock()
-def request(message):
-    try:
-        payload = message.get("data")
-        data = None if payload is None else json.dumps(payload).encode()
-        req = urllib.request.Request(message["url"], data=data, method=message.get("method"),
-                                     headers=message.get("headers", {}))
-        try:
-            with urllib.request.urlopen(req, timeout=message["timeout"]) as response:
-                result = {"status": response.status, "body": response.read().decode()}
-        except urllib.error.HTTPError as error:
-            result = {"status": error.code, "body": error.read().decode()}
-    except Exception as error:
-        result = {"error": str(error)}
-    result["id"] = message["id"]
-    with lock:
-        print(json.dumps(result), flush=True)
-with ThreadPoolExecutor(max_workers=256) as executor:
-    for line in sys.stdin:
-        executor.submit(request, json.loads(line))
-'''
-
-
 class HTTPBridge:
     def __init__(self, env=None):
         env = os.environ if env is None else env
@@ -47,7 +21,7 @@ class HTTPBridge:
         self.log = (output / ("http-client-" + str(os.getpid()) + ".log")).open("w")
         command = compose_command(env) + [
             "--profile", "tools", "run", "--rm", "--no-deps", "-T", "--name",
-            self.name, "--entrypoint", "python", "load", "-u", "-c", CLIENT]
+            self.name, "--entrypoint", "java", "load", "/app/HttpBridge.java"]
         self.process = subprocess.Popen(command, env=env, stdin=subprocess.PIPE,
                                         stdout=subprocess.PIPE, stderr=self.log,
                                         text=True, bufsize=1)
