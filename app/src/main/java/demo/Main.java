@@ -13,6 +13,7 @@ import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.sql.SQLException;
+import java.sql.SQLTransientConnectionException;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -213,7 +214,7 @@ public final class Main implements AutoCloseable {
             }
             send(exchange, 503, failure);
         } catch (Exception e) {
-            String code = e instanceof SQLException sql ? sql.getSQLState() : e.getClass().getSimpleName();
+            String code = errorCode(e);
             Map<String, Object> failure = new LinkedHashMap<>(Map.of(
                     "ok", false, "error", "Transaction/control failed",
                     "code", Objects.toString(code, "unknown")));
@@ -225,6 +226,17 @@ public final class Main implements AutoCloseable {
             }
             send(exchange, 503, failure);
         } finally { exchange.close(); }
+    }
+
+    static String errorCode(Exception error) {
+        if (error instanceof SQLException sql) {
+            String state = sql.getSQLState();
+            // OJP admission timeouts retain their JDBC subtype but may omit SQLState.
+            if ((state == null || state.isBlank()) && sql instanceof SQLTransientConnectionException)
+                return "08001";
+            return Objects.toString(state, "unknown");
+        }
+        return error.getClass().getSimpleName();
     }
 
     private void admitted(HttpExchange exchange, Work work) throws Exception {

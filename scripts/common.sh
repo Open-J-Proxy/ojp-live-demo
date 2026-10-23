@@ -3,6 +3,7 @@
 set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+export OJP_DEMO_ROOT="$ROOT_DIR"
 export RESULTS_DIR="${RESULTS_DIR:-$ROOT_DIR/results}"
 [[ "$RESULTS_DIR" = /* ]] || RESULTS_DIR="$ROOT_DIR/$RESULTS_DIR"
 export RESULTS_DIR
@@ -44,6 +45,6 @@ EOF
   fi
 }
 wait_app() {
-  python3 "$SCRIPT_DIR/http_client.py" ready --url "$(application_url)" \
+  java "$ROOT_DIR/load/HttpControls.java" ready --url "$(application_url)" \
     --timeout "${START_TIMEOUT:-180}"
 }

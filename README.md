@@ -34,6 +34,9 @@ observed.
 
 ## Start the demo
 
+Install Docker Engine with Compose v2 and **JDK 25 or newer** on your host
+(`java` and `javac` on `PATH`). No Python runtime is required.
+
 ```bash
 bash scripts/start.sh
 ```
@@ -100,7 +103,7 @@ flowchart LR
         Prom["Prometheus"]
         Grafana["Grafana"]
     end
-    Load["Python open-loop load runner"] --> App
+    Load["Java open-loop load runner"] --> App
     App -->|"Direct JDBC"| PG
     App -->|"OJP JDBC"| OJP
     OJP --> PG
@@ -116,6 +119,13 @@ Direct JDBC and OJP are exercised sequentially by the same runner. The app
 exports labeled application metrics; Prometheus also scrapes OJP and PostgreSQL
 exporter telemetry. The host-side resource sampler publishes PostgreSQL CPU and
 memory snapshots and retains the raw evidence alongside benchmark results.
+
+The producer runs directly from Java source on **Java 25 LTS**, using compact
+source files and instance `main` methods (the finalized successor to JEP 445,
+[JEP 512](https://openjdk.org/jeps/512)). No preview flags, Maven build, or
+third-party libraries are needed for the tooling. Docker supplies the producer's
+JDK; host orchestration, resource sampling, and both test harnesses also run as
+Java source files using the host JDK. The application retains its Java 21 baseline.
 
 ## Understand the results
 

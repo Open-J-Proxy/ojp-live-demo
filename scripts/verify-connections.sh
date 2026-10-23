@@ -11,4 +11,4 @@ esac
 preflight
 compose exec -T postgres sh -ec 'pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
 wait_app
-python3 "$SCRIPT_DIR/http_client.py" verify --url "$(application_url)"
+java "$ROOT_DIR/load/HttpControls.java" verify --url "$(application_url)"
