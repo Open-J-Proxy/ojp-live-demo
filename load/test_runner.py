@@ -9,6 +9,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import random
 import shutil
 import socket
 import subprocess
@@ -537,6 +538,14 @@ class RunnerTests(unittest.TestCase):
             # Arrival order at the server may differ for simultaneous worker starts.
             plans[mode] = sorted((event["seed"], event["op"]) for event in work)
         self.assertEqual(plans["direct"], plans["ojp"])
+        block = [operation for operation, weight in
+                 (("browse", 30), ("history", 25), ("checkout", 20),
+                  ("review", 10), ("account", 5), ("report", 10))
+                 for _ in range(weight)]
+        random.Random(12345).shuffle(block)
+        work_random = random.Random(12345)
+        expected = sorted((str(work_random.getrandbits(63)), operation) for operation in block)
+        self.assertEqual(plans["direct"], expected)
         modes = [event["query"]["value"] for event in app.requests("/mode")]
         self.assertEqual(modes, ["direct", "ojp"])
         classification = reports[1]["slow_query_classification"]
@@ -544,6 +553,20 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(classification["count"], 10)
         self.assertEqual(classification["by_statement"],
                          {"select report": 10, "select browse": 0})
+
+    def test_negative_and_arbitrary_precision_seeds_preserve_python_work_seeds(self):
+        mix = "browse=0,history=0,checkout=0,review=0,account=0,report=100"
+        for index, seed in enumerate((-12345, (1 << 200) + 17)):
+            with self.subTest(seed=seed):
+                reports, app, _, _ = self.run_local(options=[
+                    "--run-id", f"test-seed-{index}", "--seed", str(seed),
+                    "--operation-mix", mix, "--oltp-percent", "0", "--olap-percent", "100",
+                    "--duration", ".1"])
+                self.assertTrue(any(report["seed"] == seed for report in reports))
+                rng = random.Random(seed)
+                self.assertEqual(
+                    sorted(int(event["query"]["seed"]) for event in app.requests("/work", "measure")),
+                    sorted(rng.getrandbits(63) for _ in range(2)))
 
     def test_both_modes_and_all_rates_attempted_after_direct_failure(self):
         app = Application(control=lambda event: (
