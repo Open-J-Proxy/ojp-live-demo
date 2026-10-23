@@ -57,8 +57,7 @@ open-loop arrivals, exact-ratio workload blocks, bounded outstanding requests,
 and separate request/control timeouts. Requests use virtual threads; reaching
 `--max-in-flight` records a drop rather than blocking the arrival schedule.
 Warm-up and measurement drain independently, and Direct/OJP use the same seeded
-work plan. Java's seeded random sequence need not match the former Python
-sequence, so historical results should not be assumed to use identical requests.
+work plan.
 
 Docker remains the normal execution path via `scripts/htap.sh`. For development
 with a local JDK 25, inspect the producer CLI directly:
