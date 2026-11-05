@@ -52,15 +52,14 @@ measurement phase; choose `warmup` from the phase selector to inspect warm-up.
 See [Grafana metrics reference](docs/TECHNICAL.md#grafana-metrics-reference)
 for what each panel shows and where its data comes from.
 
-The second dashboard, [OJP operational overview](http://localhost:3000/d/ojp-overview),
-showcases OJP server metrics: SQL throughput and latency, Hikari and XA pools,
-query circuit breakers, optional cache, and RPC diagnostics. Both dashboards
-are provisioned automatically and link to each other. Select a Job (`ojp` or
-`ojp-ha` for OJP servers) and Instance to narrow the overview; Pool and
-Datasource filter only the relevant optional panels, not SQL metrics.
-Disabled or unavailable instrumentation stays **No data**, not zero.
-SQL, circuit, cache, and RPC/XA drill-down rows start collapsed; SQL labels may
-contain sensitive data, so keep dashboard access restricted.
+The second dashboard, [OJP load protection demo](http://localhost:3000/d/ojp-overview),
+focuses on request flow, end-to-end latency, backpressure, and the slowest OJP
+SQL statements. Filter by mode, phase, scenario, and load level to follow a
+traffic spike. It distinguishes load-generator drops and app-worker rejects
+from OJP backend waiters; OJP does not export a dedicated per-request throttle
+counter or user identity. Both dashboards are provisioned automatically and
+link to each other. SQL labels may contain sensitive data, so keep dashboard
+access restricted.
 
 ## Run the HTAP benchmark
 

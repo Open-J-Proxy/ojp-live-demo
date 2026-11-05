@@ -589,6 +589,9 @@ void test_14_monitoring_targets_and_exported_data() throws Exception {
     var response = E.call("/api/dashboards/uid/ojp-benchmark", null, null, 60, grafana,
         Map.of("Authorization", "Basic " + Base64.getEncoder().encodeToString(credentials.getBytes(StandardCharsets.UTF_8))));
     equal(response.status(), 200, response.body()); equal(at(response.body(), "dashboard", "uid"), "ojp-benchmark"); require(truth(at(response.body(), "dashboard", "panels")), response.body());
+    response = E.call("/api/dashboards/uid/ojp-overview", null, null, 60, grafana,
+        Map.of("Authorization", "Basic " + Base64.getEncoder().encodeToString(credentials.getBytes(StandardCharsets.UTF_8))));
+    equal(response.status(), 200, response.body()); equal(at(response.body(), "dashboard", "uid"), "ojp-overview"); require(truth(at(response.body(), "dashboard", "panels")), response.body());
     long end = deadline(90); List<Object> targets = List.of(); var jobs = new HashMap<String, Object>(); var required = Set.of("app", "postgres", "ojp", "prometheus");
     while (System.nanoTime() < end) {
         response = E.call("/api/v1/targets", null, null, 60, prometheus, Map.of()); equal(response.status(), 200, response.body());
@@ -608,6 +611,21 @@ void test_14_monitoring_targets_and_exported_data() throws Exception {
     var dashboard = LoadJson.parse(Files.readString(E.root.resolve("monitoring/grafana/dashboards/benchmark.json")));
     for (Object panel : list(at(dashboard, "panels"))) for (Object target : list(map(panel).getOrDefault("targets", List.of()))) {
         String expression = at(target, "expr").toString().replace("$mode", "direct").replace("$phase", "measure").replace("$scenario", "htap").replace("$level", "16");
+        response = E.call("/api/v1/query?query=" + encode(expression), null, null, 60, prometheus, Map.of());
+        equal(response.status(), 200, expression + ": " + response.body()); equal(at(response.body(), "status"), "success", expression + ": " + response.body());
+    }
+    dashboard = LoadJson.parse(Files.readString(E.root.resolve("monitoring/grafana/dashboards/ojp-overview.json")));
+    var overviewPanels = list(at(dashboard, "panels"));
+    require(overviewPanels.size() <= 6, "OJP demo dashboard should stay focused: " + overviewPanels.size());
+    var overviewTitles = new HashSet<String>();
+    for (Object panel : overviewPanels) overviewTitles.add(Objects.toString(map(panel).get("title")));
+    require(overviewTitles.containsAll(Set.of("Follow the load", "Request flow • offered, accepted, SQL completed",
+        "User-visible latency • P95 / P99", "Load shedding • generator drops and app rejects",
+        "OJP backend waiters", "Slowest OJP SQL • mean latency")), overviewTitles);
+    for (Object panel : overviewPanels) for (Object target : list(map(panel).getOrDefault("targets", List.of()))) {
+        String expression = at(target, "expr").toString().replace("${mode:regex}", "direct|ojp")
+            .replace("${phase}", "measure").replace("${scenario:regex}", "htap|integration")
+            .replace("${level:regex}", ".*").replace("$__range", "5m");
         response = E.call("/api/v1/query?query=" + encode(expression), null, null, 60, prometheus, Map.of());
         equal(response.status(), 200, expression + ": " + response.body()); equal(at(response.body(), "status"), "success", expression + ": " + response.body());
     }

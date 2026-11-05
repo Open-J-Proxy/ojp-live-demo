@@ -1,7 +1,7 @@
 {
   "uid":"ojp-benchmark","title":"Open J Proxy — Live JDBC Benchmark","schemaVersion":39,"version":1,"refresh":"5s","timezone":"utc",
   "time":{"from":"now-15m","to":"now"},
-  "links":[{"title":"OJP operational overview","type":"link","url":"/d/ojp-overview","keepTime":true}],
+  "links":[{"title":"OJP load protection demo","type":"link","url":"/d/ojp-overview","keepTime":true}],
   "templating":{"list":[
     {"name":"mode","type":"query","datasource":{"uid":"prometheus","type":"prometheus"},"query":"label_values(demo_completions_total, mode)","includeAll":true,"multi":true,"allValue":".*","current":{"text":"All","value":"$__all"}},
     {"name":"phase","type":"custom","query":"measure,warmup","current":{"text":"measure","value":"measure"}},
