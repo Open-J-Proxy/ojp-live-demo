@@ -99,11 +99,38 @@ Grafana dashboard). This allows sequential Direct/OJP results to be compared sid
 by side without pretending their database gauges were sampled simultaneously.
 Run IDs remain in JSON/CSV result artifacts, not Prometheus labels.
 
-The Grafana dashboard shows offered/dispatched/completed RPS, server and
+The benchmark dashboard shows offered/dispatched/completed RPS, server and
 end-to-end latency, OLTP versus OLAP P95, errors/rollbacks/drops, Direct
 HikariCP and OJP backend pool gauges, logical connections, OJP SQL
 classifications, and PostgreSQL CPU and memory. Grafana provisioning is in
 `monitoring/grafana/provisioning/`.
+
+The same file provider loads both `benchmark.json` (`/d/ojp-benchmark`) and
+`ojp-overview.json` (`/d/ojp-overview`) from
+`monitoring/grafana/dashboards/`; no manual import is needed. The operational
+overview defaults to the provisioned Prometheus datasource and a one-hour
+window with a 30-second refresh. Links between dashboards preserve the time
+range, but each dashboard keeps its own filters.
+
+The overview covers scrape health, per-instance SQL and RPC rates/latencies,
+Hikari/XA capacity and acquisition times, top-10 SQL drill-downs, query circuit
+states/events, optional cache effectiveness/source latency, and RPC/XA
+diagnostics. Job and Instance selectors come from `up`, so targets remain
+selectable even without optional OJP metrics. Pool filters Hikari/XA panels;
+Datasource filters circuit/cache/source-latency panels, never SQL metrics
+(which have no datasource label). The `ojp` and `ojp-ha` jobs select the primary
+and optional HA servers respectively; All also includes other scraped targets
+in scrape health.
+
+Metric availability depends on the OJP image and enabled instrumentation.
+The default PostgreSQL workload does not exercise XA or query caching; missing
+or disabled families intentionally show **No data**, and zero-volume ratios
+remain gaps. No synthetic data or zero fallback is added for missing families.
+RPC status counts are not SQL/application error counts, since errors may be
+encoded in OK RPC responses. Slow SQL classification follows the running
+server configuration; `htap.sh` uses an absolute threshold, not a learned
+relative classifier. Detailed rows start collapsed to limit high-cardinality
+queries. Raw SQL labels can contain sensitive data; restrict dashboard access.
 
 ### Grafana metrics reference
 
