@@ -52,6 +52,15 @@ measurement phase; choose `warmup` from the phase selector to inspect warm-up.
 See [Grafana metrics reference](docs/TECHNICAL.md#grafana-metrics-reference)
 for what each panel shows and where its data comes from.
 
+The second dashboard, [OJP load protection demo](http://localhost:3000/d/ojp-overview),
+focuses on request flow, end-to-end latency, backpressure, and the slowest OJP
+SQL statements. Filter by mode, phase, scenario, and load level to follow a
+traffic spike. It distinguishes load-generator drops and app-worker rejects
+from OJP backend waiters; OJP does not export a dedicated per-request throttle
+counter or user identity. Both dashboards are provisioned automatically and
+link to each other. SQL labels may contain sensitive data, so keep dashboard
+access restricted.
+
 ## Run the HTAP benchmark
 
 ```bash

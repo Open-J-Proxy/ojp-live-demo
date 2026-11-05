@@ -99,11 +99,36 @@ Grafana dashboard). This allows sequential Direct/OJP results to be compared sid
 by side without pretending their database gauges were sampled simultaneously.
 Run IDs remain in JSON/CSV result artifacts, not Prometheus labels.
 
-The Grafana dashboard shows offered/dispatched/completed RPS, server and
+The benchmark dashboard shows offered/dispatched/completed RPS, server and
 end-to-end latency, OLTP versus OLAP P95, errors/rollbacks/drops, Direct
 HikariCP and OJP backend pool gauges, logical connections, OJP SQL
 classifications, and PostgreSQL CPU and memory. Grafana provisioning is in
 `monitoring/grafana/provisioning/`.
+
+The same file provider loads both `benchmark.json` (`/d/ojp-benchmark`) and
+`ojp-overview.json` (`/d/ojp-overview`) from
+`monitoring/grafana/dashboards/`; no manual import is needed. The focused OJP
+overview defaults to the provisioned Prometheus datasource, a 15-minute window,
+and a 10-second refresh. Both dashboards link to each other and preserve the
+time range, but each dashboard keeps its own filters.
+
+The overview shows offered, accepted, and SQL-completed request rates;
+user-visible P95/P99 latency; generator drops, app-worker rejects, and OJP
+backend waiters; and a top-10 table of OJP SQL statements by mean execution
+latency. Mode, phase, scenario, and load level filter the demo workload. OJP
+does not export a dedicated per-request throttle counter or end-user identity,
+so those are not inferred from other metrics. The top-SQL table uses actual
+statement labels, which may contain sensitive data; restrict dashboard access.
+
+Metric availability depends on the OJP image and enabled instrumentation.
+The default PostgreSQL workload does not exercise XA or query caching; missing
+or disabled families intentionally show **No data**, and zero-volume ratios
+remain gaps. No synthetic data or zero fallback is added for missing families.
+RPC status counts are not SQL/application error counts, since errors may be
+encoded in OK RPC responses. Slow SQL classification follows the running
+server configuration; `htap.sh` uses an absolute threshold, not a learned
+relative classifier. Raw SQL labels can contain sensitive data; restrict
+dashboard access.
 
 ### Grafana metrics reference
 
